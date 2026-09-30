@@ -437,3 +437,50 @@ export async function sha256Base64Url(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", toArrayBuffer(bytes));
   return toBase64Url(new Uint8Array(digest));
 }
+
+export function generateAccessCode(): string {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  const num = buf[0] % 1000000;
+  return num.toString().padStart(6, "0");
+}
+
+export function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+
+export async function hashAccessCode(code: string, salt: Uint8Array): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(code),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: toArrayBuffer(salt),
+      iterations: 10000,
+      hash: "SHA-256"
+    },
+    key,
+    256
+  );
+  return new Uint8Array(bits);
+}
+
+export async function verifyAccessCode(
+  code: string,
+  salt: Uint8Array,
+  expectedHash: Uint8Array
+): Promise<boolean> {
+  const hash = await hashAccessCode(code, salt);
+  return constantTimeEqual(hash, expectedHash);
+}
+

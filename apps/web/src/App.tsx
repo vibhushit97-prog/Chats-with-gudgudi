@@ -39,6 +39,11 @@ import {
   type RoomInvite,
   type RoomMetadata,
   type ServerEvent,
+  type MessageDeliveryStatus,
+  type AccessCodeManageRequest,
+  type AccessCodeManageResponse,
+  type AccessCodeVerifyRequest,
+  type AccessCodeVerifyResponse,
 } from "@elm-chat/shared";
 import { startTransition, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { recordGrowthEvent, resolveExternalAcquisitionSource } from "./growth";
@@ -83,6 +88,8 @@ type UiMessage = {
   kind: "text" | "file";
   plaintext?: string;
   file?: UiFile;
+  deliveryStatus?: MessageDeliveryStatus;
+  seenAt?: number;
 };
 
 type IncomingFile = {
@@ -515,6 +522,64 @@ async function revokeInvite(roomId: string, creatorToken: string, token: string)
   }
 }
 
+async function manageAccessCode(
+  roomId: string,
+  creatorToken: string,
+  body: AccessCodeManageRequest
+): Promise<AccessCodeManageResponse> {
+  const response = await fetch(`/api/rooms/${roomId}/access-code`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${creatorToken}`
+    },
+    body: JSON.stringify(body)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error((data as { error?: string })?.error ?? "Failed to update access code");
+  }
+  return data as AccessCodeManageResponse;
+}
+
+async function getAccessCodeStatus(
+  roomId: string,
+  creatorToken: string
+): Promise<AccessCodeManageResponse> {
+  const response = await fetch(`/api/rooms/${roomId}/access-code`, {
+    headers: {
+      authorization: `Bearer ${creatorToken}`
+    }
+  });
+  if (!response.ok) {
+    throw new Error("Failed to get access code status");
+  }
+  return response.json();
+}
+
+async function verifyAccessCode(
+  roomId: string,
+  body: AccessCodeVerifyRequest
+): Promise<AccessCodeVerifyResponse> {
+  const response = await fetch(`/api/rooms/${roomId}/access-code/verify`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  const data = (await response.json().catch(() => ({}))) as AccessCodeVerifyResponse & { error?: string };
+  if (!response.ok) {
+    return {
+      ok: false,
+      error: data?.error ?? "Verification failed",
+      retryAfterSeconds: data?.retryAfterSeconds,
+      remainingAttempts: data?.remainingAttempts
+    };
+  }
+  return data;
+}
+
 async function copyText(value: string): Promise<boolean> {
   if (!navigator.clipboard?.writeText) {
     return false;
@@ -573,10 +638,14 @@ function inviteColor(invite: RoomInvite): string {
 function bubbleStyle(sessionId: string, mine: boolean): CSSProperties {
   const color = colorFromSessionId(sessionId);
   return {
-    "--bubble-accent": color,
-    "--bubble-surface": mine ? color : `color-mix(in srgb, ${color}, white 88%)`,
-    "--bubble-surface-border": `color-mix(in srgb, ${color}, white 58%)`,
-    "--bubble-text": mine ? "#fffaf3" : "var(--ink)"
+    "--bubble-accent": mine ? "#a78bfa" : color,
+    "--bubble-surface": mine
+      ? "linear-gradient(135deg, rgba(68, 25, 120, 0.42) 0%, rgba(18, 10, 32, 0.88) 100%)"
+      : "linear-gradient(135deg, rgba(26, 26, 36, 0.8) 0%, rgba(14, 14, 20, 0.92) 100%)",
+    "--bubble-surface-border": mine
+      ? "rgba(167, 139, 250, 0.28)"
+      : "rgba(226, 232, 240, 0.12)",
+    "--bubble-text": mine ? "#f8fafc" : "#f1f5f9"
   } as CSSProperties;
 }
 
@@ -663,7 +732,7 @@ function InvalidInviteScreen({ reason, focusRef }: { reason: InviteAccess } & Re
   return (
     <main className="room-shell room-shell-centered">
       <section className="access-screen" aria-live="polite">
-        <p className="eyebrow">elm chat</p>
+        <p className="eyebrow brand-eyebrow">[Mehraru]</p>
         <h1 className="access-title" ref={focusRef} tabIndex={-1}>{t("invalidLink")}</h1>
         <p className="access-copy">{copy}</p>
         <a
@@ -683,7 +752,7 @@ function RemovedFromRoomScreen({ focusRef }: RecoveryFocusTarget) {
   return (
     <main className="room-shell room-shell-centered">
       <section className="access-screen" aria-live="polite">
-        <p className="eyebrow">elm chat</p>
+        <p className="eyebrow brand-eyebrow">[Mehraru]</p>
         <h1 className="access-title" ref={focusRef} tabIndex={-1}>{t("removedTitle")}</h1>
         <p className="access-copy">{t("removedCopy")}</p>
         <a
@@ -696,6 +765,483 @@ function RemovedFromRoomScreen({ focusRef }: RecoveryFocusTarget) {
         <MakeYourOwnCallout />
       </section>
     </main>
+  );
+}
+
+function RoomAccessVaultScreen({
+  roomId,
+  inviteToken,
+  onVerified
+}: {
+  roomId: string;
+  inviteToken?: string;
+  onVerified: (ticket: string) => void;
+}) {
+  const [code, setCode] = useState("");
+  const [status, setStatus] = useState<"idle" | "verifying" | "success" | "denied" | "locked">("idle");
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [remainingAttempts, setRemainingAttempts] = useState<number | null>(null);
+  const [lockoutSeconds, setLockoutSeconds] = useState<number | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!lockoutSeconds || lockoutSeconds <= 0) return;
+    const timer = setInterval(() => {
+      setLockoutSeconds((prev) => {
+        if (!prev || prev <= 1) {
+          clearInterval(timer);
+          setStatus("idle");
+          setErrorMsg(null);
+          return null;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [lockoutSeconds]);
+
+  async function handleVerify(e?: React.FormEvent) {
+    if (e) e.preventDefault();
+    if (code.length !== 6 || status === "verifying" || status === "locked") return;
+
+    setStatus("verifying");
+    setErrorMsg(null);
+
+    try {
+      const res = await verifyAccessCode(roomId, {
+        inviteToken,
+        accessCode: code
+      });
+
+      if (res.ok && res.ticket) {
+        setStatus("success");
+        setTimeout(() => {
+          onVerified(res.ticket!);
+        }, 600);
+      } else {
+        if (res.retryAfterSeconds) {
+          setStatus("locked");
+          setLockoutSeconds(res.retryAfterSeconds);
+          setErrorMsg(`Too many failed attempts. Temporary lockout for ${res.retryAfterSeconds}s.`);
+        } else {
+          setStatus("denied");
+          setRemainingAttempts(res.remainingAttempts ?? null);
+          setErrorMsg(res.error ?? "Access Denied. Incorrect access code.");
+        }
+      }
+    } catch {
+      setStatus("denied");
+      setErrorMsg("Verification failed. Please check network connection.");
+    }
+  }
+
+  return (
+    <main className="room-shell room-shell-centered">
+      <section className={`access-screen vault-access-screen ${status === "denied" ? "is-denied" : ""} ${status === "success" ? "is-granted" : ""}`}>
+        <div className="vault-lock-badge">
+          <span className="lock-icon" aria-hidden="true">{status === "success" ? "✓" : "🔐"}</span>
+        </div>
+
+        <p className="eyebrow brand-eyebrow">[Mehraru] PRIVATE VAULT</p>
+        <h1 className="access-title">
+          {status === "success" ? "ACCESS GRANTED" : "ROOM ACCESS REQUIRED"}
+        </h1>
+        <p className="access-copy">
+          {status === "success"
+            ? "Access verified. Entering private room..."
+            : "Enter the creator-controlled 6-digit access code to enter."}
+        </p>
+
+        {status !== "success" && (
+          <form className="vault-pin-form" onSubmit={handleVerify}>
+            <div
+              className="vault-pin-display"
+              onClick={() => inputRef.current?.focus()}
+              role="presentation"
+            >
+              {[0, 1, 2, 3, 4, 5].map((index) => {
+                const char = code[index];
+                const isCurrent = code.length === index;
+                return (
+                  <div
+                    key={index}
+                    className={`pin-cell ${char ? "is-filled" : ""} ${isCurrent ? "is-active" : ""}`}
+                  >
+                    {char ? "•" : ""}
+                  </div>
+                );
+              })}
+            </div>
+
+            <input
+              ref={inputRef}
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={6}
+              value={code}
+              disabled={status === "locked" || status === "verifying"}
+              onChange={(e) => {
+                const val = e.target.value.replace(/\D/g, "").slice(0, 6);
+                setCode(val);
+                if (val.length === 6) {
+                  setTimeout(() => {
+                    const form = inputRef.current?.form;
+                    form?.requestSubmit();
+                  }, 50);
+                }
+              }}
+              className="vault-pin-hidden-input"
+              aria-label="Room access code 6 digits"
+              autoComplete="one-time-code"
+            />
+
+            {errorMsg && (
+              <div className={`vault-auth-alert ${status === "locked" ? "is-warning" : "is-error"}`} role="alert">
+                <span>{errorMsg}</span>
+                {remainingAttempts !== null && remainingAttempts > 0 && status !== "locked" && (
+                  <span className="attempts-remaining">({remainingAttempts} attempts remaining)</span>
+                )}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className={`primary-button vault-verify-btn ${status === "verifying" ? "is-verifying" : ""}`}
+              disabled={code.length !== 6 || status === "verifying" || status === "locked"}
+            >
+              {status === "verifying" ? "VERIFYING..." : "VERIFY ACCESS CODE"}
+            </button>
+          </form>
+        )}
+
+        <div className="vault-access-footer">
+          <span className="vault-subtext">Protected by room creator · End-to-end encrypted vault</span>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function RoomSecurityModal({
+  roomId,
+  creatorToken,
+  room,
+  invites,
+  knownAccessCode,
+  presenceCount,
+  onClose,
+  onUpdateCode,
+  onRevokeInvite
+}: {
+  roomId: string;
+  creatorToken: string;
+  room: RoomMetadata | null;
+  invites: RoomInvite[];
+  knownAccessCode?: string;
+  presenceCount: number;
+  onClose: () => void;
+  onUpdateCode: (code?: string, enabled?: boolean) => void;
+  onRevokeInvite: (token: string) => void;
+}) {
+  const [customCode, setCustomCode] = useState("");
+  const [working, setWorking] = useState(false);
+  const [msg, setMsg] = useState<{ text: string; kind: "info" | "success" | "error" } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  async function handleGenerate() {
+    setWorking(true);
+    setMsg(null);
+    try {
+      const res = await manageAccessCode(roomId, creatorToken, { action: "generate" });
+      onUpdateCode(res.code, true);
+      setMsg({ text: "New 6-digit access code generated successfully.", kind: "success" });
+    } catch (e) {
+      setMsg({ text: e instanceof Error ? e.message : "Failed to generate code", kind: "error" });
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function handleSetCustom(e: React.FormEvent) {
+    e.preventDefault();
+    if (!/^\d{6}$/.test(customCode)) {
+      setMsg({ text: "Access code must be exactly 6 numeric digits.", kind: "error" });
+      return;
+    }
+    setWorking(true);
+    setMsg(null);
+    try {
+      const res = await manageAccessCode(roomId, creatorToken, { action: "set", code: customCode });
+      onUpdateCode(res.code, true);
+      setCustomCode("");
+      setMsg({ text: "Custom access code configured successfully.", kind: "success" });
+    } catch (e) {
+      setMsg({ text: e instanceof Error ? e.message : "Failed to set code", kind: "error" });
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function handleRevoke() {
+    if (!window.confirm("Are you sure you want to revoke the room access code? Any participant attempting to join will be denied until a new code is set.")) return;
+    setWorking(true);
+    setMsg(null);
+    try {
+      await manageAccessCode(roomId, creatorToken, { action: "revoke" });
+      onUpdateCode(undefined, false);
+      setMsg({ text: "Room access code revoked. Entry is now blocked.", kind: "info" });
+    } catch (e) {
+      setMsg({ text: e instanceof Error ? e.message : "Failed to revoke code", kind: "error" });
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function handleDisable() {
+    if (!window.confirm("Disable access code protection for this room? Guests will only need the invitation link.")) return;
+    setWorking(true);
+    setMsg(null);
+    try {
+      await manageAccessCode(roomId, creatorToken, { action: "disable" });
+      onUpdateCode(undefined, false);
+      setMsg({ text: "Access code protection disabled.", kind: "info" });
+    } catch (e) {
+      setMsg({ text: e instanceof Error ? e.message : "Failed to disable code", kind: "error" });
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function handleCopy() {
+    if (!knownAccessCode) return;
+    if (await copyText(knownAccessCode)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    }
+  }
+
+  return (
+    <div
+      className="vault-modal-backdrop"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="vault-modal" role="dialog" aria-modal="true" aria-labelledby="security-modal-title">
+        <div className="vault-modal-header">
+          <div className="modal-title-cluster">
+            <span className="modal-key-icon" aria-hidden="true">🛡️</span>
+            <div>
+              <h2 id="security-modal-title">Room Security & Access Code</h2>
+              <p className="modal-sub">Creator-controlled access protection & guest authentication</p>
+            </div>
+          </div>
+          <button className="modal-close-btn" onClick={onClose} type="button" aria-label="Close modal">
+            ✕
+          </button>
+        </div>
+
+        <div className="vault-modal-body">
+          {/* Guest authentication presence */}
+          <div className="security-status-card">
+            <div className="status-header-row">
+              <span className="setting-label">Person 2 Status</span>
+              <span className="status-indicator">
+                {presenceCount >= 2 ? (
+                  <><span className="conn-dot" style={{ background: "#10b981" }} /> Authenticated & Present</>
+                ) : room?.accessCodeVerified ? (
+                  <><span className="conn-dot" style={{ background: "#a78bfa" }} /> Verified (Offline/Reconnecting)</>
+                ) : (
+                  <><span className="conn-dot" style={{ background: "#f59e0b" }} /> Awaiting Code Verification</>
+                )}
+              </span>
+            </div>
+            <p className="setting-note" style={{ margin: 0 }}>
+              The room strictly supports exactly two participants. Person 2 cannot join without authenticating.
+            </p>
+          </div>
+
+          {/* Access code controls */}
+          <div className="security-status-card">
+            <div className="status-header-row">
+              <span className="setting-label">Access Code Protection</span>
+              <span className="vault-badge-secure" style={{
+                background: room?.accessCodeProtected ? "rgba(16, 185, 129, 0.2)" : "rgba(244, 63, 94, 0.2)",
+                borderColor: room?.accessCodeProtected ? "rgba(16, 185, 129, 0.4)" : "rgba(244, 63, 94, 0.4)",
+                color: room?.accessCodeProtected ? "#34d399" : "#fda4af"
+              }}>
+                {room?.accessCodeProtected ? "ENABLED" : "DISABLED"}
+              </span>
+            </div>
+
+            {room?.accessCodeProtected && knownAccessCode && (
+              <div className="code-display-box">
+                <div>
+                  <span className="eyebrow" style={{ color: "var(--muted)", fontSize: 10 }}>ACTIVE ACCESS CODE</span>
+                  <div className="code-numbers">{knownAccessCode}</div>
+                </div>
+                <button
+                  className={`secondary-button ${copied ? "button-success" : ""}`}
+                  onClick={handleCopy}
+                  type="button"
+                >
+                  {copied ? "Copied!" : "Copy Code"}
+                </button>
+              </div>
+            )}
+
+            <p className="setting-note" style={{ margin: 0 }}>
+              {room?.accessCodeProtected
+                ? "The code is salted and hashed using PBKDF2 on the server. Share it out-of-band with your guest."
+                : "Enable an access code to prevent anyone from joining without creator authorization."}
+            </p>
+
+            <div className="security-actions-grid">
+              <button
+                className="secondary-button"
+                disabled={working}
+                onClick={handleGenerate}
+                type="button"
+              >
+                ⚡ {room?.accessCodeProtected ? "Regenerate Code" : "Generate Code"}
+              </button>
+              {room?.accessCodeProtected ? (
+                <button
+                  className="secondary-button"
+                  style={{ color: "#fda4af", borderColor: "rgba(244, 63, 94, 0.3)" }}
+                  disabled={working}
+                  onClick={handleRevoke}
+                  type="button"
+                >
+                  🚫 Revoke Code
+                </button>
+              ) : null}
+            </div>
+
+            <form onSubmit={handleSetCustom} className="custom-code-input-row" style={{ marginTop: 6 }}>
+              <input
+                className="setting-input custom-code-input"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={6}
+                placeholder="Custom 6 Digits"
+                value={customCode}
+                onChange={(e) => setCustomCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                disabled={working}
+              />
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={customCode.length !== 6 || working}
+              >
+                Set Code
+              </button>
+            </form>
+
+            {room?.accessCodeProtected && (
+              <button
+                className="secondary-button"
+                style={{ fontSize: 12, marginTop: 4, alignSelf: "flex-start", opacity: 0.8 }}
+                onClick={handleDisable}
+                disabled={working}
+                type="button"
+              >
+                Disable Code Protection
+              </button>
+            )}
+          </div>
+
+          {msg && (
+            <div
+              className={`vault-auth-alert ${msg.kind === "error" ? "is-error" : msg.kind === "success" ? "is-granted" : "is-warning"}`}
+              style={{
+                background: msg.kind === "success" ? "rgba(16, 185, 129, 0.15)" : undefined,
+                color: msg.kind === "success" ? "#6ee7b7" : undefined,
+                borderColor: msg.kind === "success" ? "rgba(16, 185, 129, 0.4)" : undefined
+              }}
+            >
+              {msg.text}
+            </div>
+          )}
+
+          {/* Active Invites & Revocation */}
+          {invites.filter((i) => !i.revokedAt).length > 0 && (
+            <div className="vault-invites-block" style={{ marginTop: 8 }}>
+              <span className="eyebrow">Active Invitations ({invites.filter((i) => !i.revokedAt).length})</span>
+              <div className="vault-invites-scroll">
+                {invites.filter((i) => !i.revokedAt).map((invite) => (
+                  <div className="invite-row vault-invite-row" key={invite.token}>
+                    <div className="vault-invite-meta">
+                      <span className="invite-tag">{inviteStatusLabel(invite)}</span>
+                      <span className="invite-token-code">Token: {invite.token.slice(0, 8)}...</span>
+                    </div>
+                    <div className="invite-actions">
+                      <button
+                        className="secondary-button invite-revoke"
+                        onClick={() => onRevokeInvite(invite.token)}
+                        type="button"
+                      >
+                        Revoke Invite
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MehraruLogo({ size = 24, className = "" }: { size?: number; className?: string }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className={`mehraru-logo ${className}`}
+      fill="none"
+      height={size}
+      viewBox="0 0 24 24"
+      width={size}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <defs>
+        <linearGradient id="vaultGrad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="#c4b5fd" />
+          <stop offset="45%" stopColor="#8b5cf6" />
+          <stop offset="100%" stopColor="#4c1d95" />
+        </linearGradient>
+        <linearGradient id="shieldGrad" x1="12" y1="2" x2="12" y2="22" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="rgba(139, 92, 246, 0.22)" />
+          <stop offset="100%" stopColor="rgba(20, 10, 36, 0.55)" />
+        </linearGradient>
+      </defs>
+      <path
+        d="M12 2.5L3.5 6.2v5.8c0 5.4 3.6 10.4 8.5 11.6 4.9-1.2 8.5-6.2 8.5-11.6V6.2L12 2.5z"
+        fill="url(#shieldGrad)"
+        stroke="url(#vaultGrad)"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.6"
+      />
+      <circle cx="8.5" cy="11.5" fill="#e2e8f0" r="1.6" />
+      <circle cx="15.5" cy="11.5" fill="#a78bfa" r="1.6" />
+      <path
+        d="M8.5 11.5h7"
+        stroke="#cbd5e1"
+        strokeDasharray="1.5 1.5"
+        strokeLinecap="round"
+        strokeWidth="1.25"
+      />
+      <circle cx="12" cy="15.5" fill="#c4b5fd" r="1" />
+    </svg>
   );
 }
 
@@ -766,7 +1312,7 @@ function InviteCheckingScreen({ connection, error, onRetry, focusRef }: {
   return (
     <main className="room-shell room-shell-centered">
       <section className="access-screen" aria-live="polite">
-        <p className="eyebrow">elm chat</p>
+        <p className="eyebrow brand-eyebrow">[Mehraru]</p>
         <h1 className="access-title">{t("checkingInvite")}</h1>
         <p className="access-copy">{t("verifyingInvite")}</p>
         <p ref={focusRef} tabIndex={-1}>{connection}</p>
@@ -782,7 +1328,7 @@ function RoomGoneScreen({ fromInvite, reason, focusRef }: { fromInvite: boolean;
   return (
     <main className="room-shell room-shell-centered">
       <section className="access-screen" aria-live="polite">
-        <p className="eyebrow">elm chat</p>
+        <p className="eyebrow brand-eyebrow">[Mehraru]</p>
         <h1 className="access-title" ref={focusRef} tabIndex={-1}>{t("roomGone")}</h1>
         <p className="access-copy">
           {reason ?? t("roomGoneCopy")}
@@ -911,9 +1457,13 @@ function LandingPage() {
         ),
         inactivityTimeoutMs: parseDurationDraft(roomDuration, 10, "minutes", "milliseconds"),
         maxAgeMs: null,
+        generateAccessCode: true,
         turnstileToken
       });
       safeStorageSet("local", creatorTokenKey(room.roomId), room.creatorToken);
+      if (room.accessCode) {
+        safeStorageSet("session", `elm-chat:access-code:${room.roomId}`, room.accessCode);
+      }
       window.location.assign(`${room.roomUrl}#${secret}`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("unableCreateRoom"));
@@ -950,31 +1500,25 @@ function LandingPage() {
               </div>
             </aside>
           ) : null}
-          <p className="hero-brand">
-            <span className="hero-brand-name">elm chat</span>
-            <span className="hero-brand-meaning">
-              <span className="hero-brand-separator" aria-hidden="true">·</span>
-              {t("nameMeaning")}
-            </span>
-          </p>
-          <div className="hero-links" aria-label={t("learnAbout")}>
-            <a className="hero-link" href={whyUseUrl} rel="noreferrer" target="_blank">
-              {t("whyUse")}
-            </a>
-            <a className="hero-link" href={articleUrl} rel="noreferrer" target="_blank">
-              {t("readArticle")}
-            </a>
-            <a className="hero-link" href="/press">
-              {t("pressKit")}
-            </a>
-            <a className="hero-link" href="/security-and-limitations">
-              {t("securityStatus")}
-            </a>
+          <div className="hero-brand">
+            <MehraruLogo size={34} />
+            <div className="hero-brand-info">
+              <span className="hero-brand-name">[Mehraru]</span>
+              <span className="hero-brand-meaning">
+                <span className="hero-brand-separator" aria-hidden="true">·</span>
+                {t("nameMeaning")}
+              </span>
+            </div>
           </div>
           <h1>{t("heroTitle")}</h1>
           <p className="lede">
             {t("heroCopy")}
           </p>
+          <div className="hero-privacy-badges" aria-label="Privacy Highlights">
+            <span className="privacy-pill">🔒 1-on-1 Only</span>
+            <span className="privacy-pill">🛡️ In-Browser Encrypted</span>
+            <span className="privacy-pill">⏱️ Disappearing Messages</span>
+          </div>
           <div className="creation-panel">
             <div className="setting-row" role="group" aria-labelledby="message-policy-label">
               <div>
@@ -1098,110 +1642,54 @@ function LandingPage() {
         </div>
         <div className="hero-panel">
           <div className="signal-grid" />
-          <div className="hero-panel-top">
-          <a
-            className="github-cta"
-            href={GITHUB_URL}
-            onClick={() =>
-              recordGrowthEvent("github_star_clicked", externalSource ?? undefined)
-            }
-            rel="noreferrer"
-            target="_blank"
-          >
-            <GithubMark size={22} />
-            <span className="github-cta-copy">
-              <strong>{t("githubHeadline")}</strong>
-              <span>{t("githubCopy")}</span>
-            </span>
-            <span className="github-cta-stats" aria-label={t("githubStats")}>
-              {ghStats.stars !== null ? (
-                <span className="github-stat">
-                  <span aria-hidden="true">★</span> {formatCount(ghStats.stars)}
-                </span>
-              ) : null}
-              {ghStats.forks !== null ? (
-                <span className="github-stat">
-                  <span aria-hidden="true">⑂</span> {formatCount(ghStats.forks)}
-                </span>
-              ) : null}
-            </span>
-          </a>
-          <div className="github-links" aria-label={t("projectSource")}>
-            <a className="github-mini" href={GITHUB_URL} rel="noreferrer" target="_blank">
-              <GithubMark size={13} /> {t("viewSource")}
-            </a>
-            <a className="github-mini" href={`${GITHUB_URL}/fork`} rel="noreferrer" target="_blank">
-              {t("forkMe")}
-            </a>
-            <a
-              className="github-mini"
-              href={`${GITHUB_URL}/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22`}
-              onClick={() =>
-                recordGrowthEvent("good_first_issue_clicked", externalSource ?? undefined)
-              }
-              rel="noreferrer"
-              target="_blank"
-            >
-              {t("starterIssue")}
-            </a>
-          </div>
-          </div>
-          <div className="github-community" aria-label={t("communityTitle")}>
-            <div className="community-section">
-              <div className="community-heading">
-                <h2>{t("latestFixes")}</h2>
-                <a href={`${GITHUB_URL}/issues?q=is%3Aissue%20state%3Aclosed`} rel="noreferrer" target="_blank">
-                  {t("viewAll")}
-                </a>
-              </div>
-              {community?.fixes.map((issue) => (
-                <a className="community-fix" href={issue.url} key={issue.number} rel="noreferrer" target="_blank">
-                  <span className="community-number">#{issue.number}</span>
-                  <span className="community-title">{issue.title}</span>
-                </a>
-              ))}
-              {community && community.fixes.length === 0 ? <p className="community-empty">{t("noFixes")}</p> : null}
-            </div>
-            <div className="community-section">
-              <div className="community-heading">
-                <h2>{t("openRequests")}</h2>
-                <a href={`${GITHUB_URL}/issues?q=is%3Aissue%20state%3Aopen`} rel="noreferrer" target="_blank">
-                  {t("viewAll")}
-                </a>
-              </div>
-              {community?.requests.map((issue) => (
-                <a className="community-request" href={issue.url} key={issue.number} rel="noreferrer" target="_blank">
-                  <span className="community-number">#{issue.number}</span>
-                  <span className="community-title">{issue.title}</span>
-                </a>
-              ))}
-              {community && community.requests.length === 0 ? (
-                <p className="community-empty">{t("noRequests")}</p>
-              ) : null}
-            </div>
-            {!community && !communityError ? <p className="community-empty">{t("loadingCommunity")}</p> : null}
-            {communityError ? (
-              <p className="community-empty">{t("communityUnavailable")}{" "}
-                <a href={`${GITHUB_URL}/issues`} rel="noreferrer" target="_blank">{t("viewOnGithub")}</a>
+          <div className="architecture-panel">
+            <div className="architecture-header">
+              <span className="eyebrow">Architecture & Guarantees</span>
+              <h2>Private by design. Temporary by default.</h2>
+              <p className="architecture-intro">
+                Built specifically for private, two-person communication that self-destructs without leaving a digital trace.
               </p>
-            ) : null}
-          </div>
-          <div className="hero-metrics">
-            <div>
-              <span>{t("access")}</span>
-              <strong>{t("secretLinkOnly")}</strong>
             </div>
-            <div>
-              <span>{t("messagePolicy")}</span>
-              <strong>
-                {messageDuration.indefinite
-                  ? t("manualCleanup")
-                  : formatSelectedDuration(messageDuration.amount, messageDuration.unit, false)}
-              </strong>
+            <div className="architecture-cards">
+              <div className="architecture-card">
+                <div className="card-badge">01</div>
+                <div className="card-body">
+                  <h3>One-Time Cryptographic Invite</h3>
+                  <p>Each link admits only one guest. Once joined, the single-use invite token is consumed, preventing forwarded links or eavesdroppers from entering.</p>
+                </div>
+              </div>
+              <div className="architecture-card">
+                <div className="card-badge">02</div>
+                <div className="card-body">
+                  <h3>Client-Side Web Crypto</h3>
+                  <p>All message plaintext and attachments are encrypted and decrypted directly in your browser. Encryption keys stay in the URL fragment (#) and never reach the server.</p>
+                </div>
+              </div>
+              <div className="architecture-card">
+                <div className="card-badge">03</div>
+                <div className="card-body">
+                  <h3>Disappearing Messages & Ephemeral State</h3>
+                  <p>Messages vanish on timer after reading. The entire room and all session memory self-destruct when closed or upon inactivity.</p>
+                </div>
+              </div>
             </div>
-            <div>
-              <span>{t("roomPolicy")}</span>
-              <strong>{roomDuration.indefinite ? t("noIdleTimeout") : t("idleSelfDestruct")}</strong>
+            <div className="hero-metrics">
+              <div>
+                <span>{t("access")}</span>
+                <strong>{t("secretLinkOnly")}</strong>
+              </div>
+              <div>
+                <span>{t("messagePolicy")}</span>
+                <strong>
+                  {messageDuration.indefinite
+                    ? t("manualCleanup")
+                    : formatSelectedDuration(messageDuration.amount, messageDuration.unit, false)}
+                </strong>
+              </div>
+              <div>
+                <span>{t("roomPolicy")}</span>
+                <strong>{roomDuration.indefinite ? t("noIdleTimeout") : t("idleSelfDestruct")}</strong>
+              </div>
             </div>
           </div>
         </div>
@@ -1266,6 +1754,17 @@ function RoomPage({ roomId }: { roomId: string }) {
     amount: "10",
     unit: "minutes"
   });
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [accessCodeTicket, setAccessCodeTicket] = useState<string | null>(() => {
+    return safeStorageGet("session", `elm-chat:ticket:${roomId}`);
+  });
+  const [accessCodeVerified, setAccessCodeVerified] = useState<boolean>(() => {
+    return Boolean(safeStorageGet("session", `elm-chat:ticket:${roomId}`));
+  });
+  const [knownAccessCode, setKnownAccessCode] = useState<string | undefined>(() => {
+    return safeStorageGet("session", `elm-chat:access-code:${roomId}`) ?? undefined;
+  });
+  const [showSecurityModal, setShowSecurityModal] = useState(false);
   const [sessionId] = useState(() => {
     const stored = safeStorageGet("session", sessionKey(roomId));
     if (stored) {
@@ -1297,6 +1796,8 @@ function RoomPage({ roomId }: { roomId: string }) {
   const { chatLogRef, awayFromLatest, newMessageCount, jumpToLatest, handleConversationScroll } =
     useConversationScroll(messages, ready, conversationFind.open);
   const messageRef = useRef(new Map<string, AuthenticatedPeerEvent>());
+  const destroyedMessageIdsRef = useRef(new Set<string>());
+  const seenMessageIdsRef = useRef(new Set<string>());
   const replayGuardRef = useRef<ReplayGuard | null>(null);
   const eventReplayGuardRef = useRef<ReplayGuard | null>(null);
   if (!replayGuardRef.current) {
@@ -1325,6 +1826,74 @@ function RoomPage({ roomId }: { roomId: string }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   // Object URLs created for received files, revoked on expiry/unmount.
   const objectUrlsRef = useRef(new Set<string>());
+
+  const checkVisibleMessages = useCallback(() => {
+    if (!joinedRef.current) return;
+    if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const chatLog = chatLogRef.current;
+    if (!chatLog) return;
+
+    const logRect = chatLog.getBoundingClientRect();
+    if (logRect.height === 0 || logRect.width === 0) return;
+
+    for (const msg of messages) {
+      if (msg.senderSessionId === sessionId) continue;
+      if (msg.deliveryStatus === "seen" || msg.deliveryStatus === "destroyed") continue;
+      if (seenMessageIdsRef.current.has(msg.id) || destroyedMessageIdsRef.current.has(msg.id)) continue;
+
+      const element = chatLog.querySelector(`[data-message-id="${CSS.escape(msg.id)}"]`);
+      if (!element) continue;
+
+      const elRect = element.getBoundingClientRect();
+      const isVisibleInViewport =
+        elRect.bottom > logRect.top &&
+        elRect.top < logRect.bottom &&
+        elRect.height > 0;
+
+      if (isVisibleInViewport) {
+        seenMessageIdsRef.current.add(msg.id);
+        socket.send(JSON.stringify({
+          type: "message_seen",
+          messageId: msg.id
+        }));
+      }
+    }
+  }, [messages, sessionId]);
+
+  useEffect(() => {
+    if (typeof requestAnimationFrame === "function") {
+      const raf = requestAnimationFrame(() => {
+        checkVisibleMessages();
+      });
+      return () => cancelAnimationFrame(raf);
+    } else {
+      checkVisibleMessages();
+    }
+  }, [messages, checkVisibleMessages]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        checkVisibleMessages();
+      }
+    };
+    const onActive = () => {
+      checkVisibleMessages();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", onActive);
+    window.addEventListener("resize", onActive);
+    const chatLog = chatLogRef.current;
+    chatLog?.addEventListener("scroll", onActive, { passive: true });
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", onActive);
+      window.removeEventListener("resize", onActive);
+      chatLog?.removeEventListener("scroll", onActive);
+    };
+  }, [checkVisibleMessages]);
 
   async function sendPeerData(payload: PeerDataEvent, toSessionId?: string, isCurrent?: () => boolean) {
     const socket = socketRef.current;
@@ -1724,6 +2293,12 @@ function RoomPage({ roomId }: { roomId: string }) {
           return;
         }
 
+        const currentTicket = accessCodeTicket || safeStorageGet("session", `elm-chat:ticket:${roomId}`) || undefined;
+        if (metadata.accessCodeProtected && isInviteGuest && !accessCodeVerified && !currentTicket) {
+          setReady(true);
+          return;
+        }
+
         const socket = new WebSocket(wsUrl(`/api/rooms/${roomId}/ws`));
         socketRef.current = socket;
 
@@ -1738,7 +2313,8 @@ function RoomPage({ roomId }: { roomId: string }) {
               identityKey: identityKeyRef.current,
               agreementKey: agreementPublicKeyRef.current,
               creatorToken: creatorToken || undefined,
-              inviteToken: inviteToken || undefined
+              inviteToken: inviteToken || undefined,
+              accessCodeTicket: currentTicket
             })
           );
         });
@@ -1751,6 +2327,13 @@ function RoomPage({ roomId }: { roomId: string }) {
           setKeyReady(false);
           if (isInviteGuest && closeEvent.code === 4403) {
             stopReconnecting();
+            if (closeEvent.reason && closeEvent.reason.includes("access code")) {
+              safeStorageRemove("session", `elm-chat:ticket:${roomId}`);
+              setAccessCodeTicket(null);
+              setAccessCodeVerified(false);
+              setReady(true);
+              return;
+            }
             setInviteAccess((current) => {
               if (current === "claimed" || current === "used") {
                 return current;
@@ -1836,14 +2419,18 @@ function RoomPage({ roomId }: { roomId: string }) {
               void refreshInvites();
             }
             if (messageRef.current.size > 0) {
-              await sendPeerData({
-                type: "sync_response",
-                messages: [...messageRef.current.values()]
-                  .sort((left, right) => left.sentAt - right.sentAt)
-                  .slice(-MAX_TRANSCRIPT_SYNC_MESSAGES),
-                completeness: "peer-partial",
-                truncated: messageRef.current.size > MAX_TRANSCRIPT_SYNC_MESSAGES
-              }, payload.peer.sessionId);
+              const validMessages = [...messageRef.current.values()]
+                .filter((e) => e.payload.type === "chat_message" && !destroyedMessageIdsRef.current.has(e.payload.envelope.messageId))
+                .sort((left, right) => left.sentAt - right.sentAt)
+                .slice(-MAX_TRANSCRIPT_SYNC_MESSAGES);
+              if (validMessages.length > 0) {
+                await sendPeerData({
+                  type: "sync_response",
+                  messages: validMessages,
+                  completeness: "peer-partial",
+                  truncated: messageRef.current.size > MAX_TRANSCRIPT_SYNC_MESSAGES
+                }, payload.peer.sessionId);
+              }
             }
             return;
           }
@@ -1874,6 +2461,46 @@ function RoomPage({ roomId }: { roomId: string }) {
 
           if (payload.type === "peer_data") {
             await handlePeerData(payload.fromSessionId, payload.data, socket);
+            return;
+          }
+
+          if (payload.type === "message_delivered") {
+            startTransition(() => {
+              setMessages((current) =>
+                current.map((msg) =>
+                  msg.id === payload.messageId && (!msg.deliveryStatus || msg.deliveryStatus === "sent")
+                    ? { ...msg, deliveryStatus: "delivered" }
+                    : msg
+                )
+              );
+            });
+            return;
+          }
+
+          if (payload.type === "message_seen") {
+            seenMessageIdsRef.current.add(payload.messageId);
+            startTransition(() => {
+              setMessages((current) =>
+                current.map((msg) => {
+                  if (msg.id !== payload.messageId) return msg;
+                  return {
+                    ...msg,
+                    deliveryStatus: "seen",
+                    seenAt: payload.seenAt,
+                    expiresAt: payload.destroyedAt ?? msg.expiresAt
+                  };
+                })
+              );
+            });
+            return;
+          }
+
+          if (payload.type === "message_destroyed") {
+            destroyedMessageIdsRef.current.add(payload.messageId);
+            messageRef.current.delete(payload.messageId);
+            startTransition(() => {
+              setMessages((current) => current.filter((msg) => msg.id !== payload.messageId));
+            });
             return;
           }
 
@@ -1992,6 +2619,7 @@ function RoomPage({ roomId }: { roomId: string }) {
     async function addEnvelope(event: AuthenticatedPeerEvent) {
       if (event.payload.type !== "chat_message") return;
       const envelope = event.payload.envelope;
+      if (destroyedMessageIdsRef.current.has(envelope.messageId)) return;
       const messageKey = roomKeysRef.current.get(envelope.keyEpoch);
       if (!messageKey) return;
 
@@ -2003,6 +2631,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         const { plaintext, expiresAt } = received;
         messageRef.current.set(envelope.messageId, event);
 
+        const mine = envelope.senderSessionId === sessionId;
         startTransition(() => {
           setMessages((current) =>
             upsertMessage(current, {
@@ -2011,10 +2640,21 @@ function RoomPage({ roomId }: { roomId: string }) {
               plaintext,
               sentAt: envelope.sentAt,
               expiresAt,
-              kind: "text"
+              kind: "text",
+              deliveryStatus: mine ? "sent" : "delivered"
             })
           );
         });
+
+        if (!mine) {
+          const socket = socketRef.current;
+          if (socket?.readyState === WebSocket.OPEN && joinedRef.current) {
+            socket.send(JSON.stringify({
+              type: "message_delivered",
+              messageId: envelope.messageId
+            }));
+          }
+        }
       } catch (cause) {
         setError(
           cause instanceof InvalidMessageEnvelopeError
@@ -2080,6 +2720,7 @@ function RoomPage({ roomId }: { roomId: string }) {
 
       if (payload.type === "sync_request") {
         const transcript = [...messageRef.current.values()]
+          .filter((e) => e.payload.type === "chat_message" && !destroyedMessageIdsRef.current.has(e.payload.envelope.messageId))
           .sort((left, right) => left.sentAt - right.sentAt)
           .slice(-MAX_TRANSCRIPT_SYNC_MESSAGES);
         await sendPeerData({
@@ -2105,6 +2746,9 @@ function RoomPage({ roomId }: { roomId: string }) {
               : t("syncPartial")
         );
         for (const syncedEvent of payload.messages.slice(-MAX_TRANSCRIPT_SYNC_MESSAGES)) {
+          if (syncedEvent.payload.type === "chat_message" && destroyedMessageIdsRef.current.has(syncedEvent.payload.envelope.messageId)) {
+            continue;
+          }
           if (await verifyPeerEvent(syncedEvent)) await addEnvelope(syncedEvent);
         }
         return;
@@ -2220,7 +2864,7 @@ function RoomPage({ roomId }: { roomId: string }) {
       socketRef.current?.close();
       for (const [fileId, transfer] of incomingFilesRef.current) removeIncomingFile(fileId, transfer);
     };
-  }, [creatorToken, inviteToken, roomId, roomSecret, sessionId]);
+  }, [creatorToken, inviteToken, roomId, roomSecret, sessionId, accessCodeVerified, accessCodeTicket]);
 
   useEffect(() => {
     if (copyFeedback !== "success") {
@@ -2368,7 +3012,8 @@ function RoomPage({ roomId }: { roomId: string }) {
           plaintext: trimmed,
           sentAt,
           expiresAt,
-          kind: "text"
+          kind: "text",
+          deliveryStatus: "sent"
         }));
       });
     } catch {
@@ -2586,6 +3231,12 @@ function RoomPage({ roomId }: { roomId: string }) {
   }
 
   useEffect(() => {
+    if (showManualInvite && manualInvite) {
+      setShowInviteModal(true);
+    }
+  }, [showManualInvite, manualInvite]);
+
+  useEffect(() => {
     if (removedFromRoom || notFound || (room && room.status !== "open") ||
       ["invalid", "claimed", "used"].includes(inviteAccess)) conversationFind.close();
   }, [removedFromRoom, notFound, room?.status, inviteAccess]);
@@ -2618,6 +3269,20 @@ function RoomPage({ roomId }: { roomId: string }) {
     );
   }
 
+  if (room?.accessCodeProtected && isInviteGuest && !accessCodeVerified && !accessCodeTicket) {
+    return (
+      <RoomAccessVaultScreen
+        roomId={roomId}
+        inviteToken={inviteToken}
+        onVerified={(ticket) => {
+          safeStorageSet("session", `elm-chat:ticket:${roomId}`, ticket);
+          setAccessCodeTicket(ticket);
+          setAccessCodeVerified(true);
+        }}
+      />
+    );
+  }
+
   if (isInviteGuest && (inviteAccess !== "granted" || !room || !ready)) {
     return <InviteCheckingScreen connection={connection} error={connectionError ?? error}
       focusRef={setRetryFocusTarget}
@@ -2625,227 +3290,380 @@ function RoomPage({ roomId }: { roomId: string }) {
   }
 
   return (
-    <main className="room-shell">
-      <header className="room-header">
-        <div className="room-title">
-          <p className="eyebrow">elm chat</p>
-          <h1>{roomId.slice(0, 8)}</h1>
-          <p className="room-subtitle">
-            {messagePolicyLabel} {roomPolicyLabel}
-          </p>
-        </div>
-        <div className="room-toolbar">
-          <div className="room-meta" aria-live="polite" ref={setRetryFocusTarget} tabIndex={-1}>
-            <span>{connection}</span>
-            <span>{t("present", { count: presentCount })}</span>
+    <main className="room-shell room-vault-shell">
+      <header className="room-vault-header">
+        <div className="vault-header-top">
+          <div className="vault-brand-cluster">
+            <MehraruLogo size={22} />
+            <div className="vault-brand-meta">
+              <span className="vault-name">[Mehraru]</span>
+              <span className="vault-badge">VAULT</span>
+            </div>
+            <span className="vault-room-id" title={roomId}>
+              <span className="vault-lock-glyph" aria-hidden="true">🔒</span>
+              <span className="vault-room-num">#{roomId.slice(0, 8)}</span>
+            </span>
           </div>
-          <div className="room-actions">
+
+          <div className="vault-actions">
             {canRetryConnection ? (
-              <button className="secondary-button" onClick={() => retryConnectionRef.current?.()} type="button">
+              <button className="secondary-button vault-action-btn" onClick={() => retryConnectionRef.current?.()} type="button">
                 {t("retryConnection")}
               </button>
             ) : null}
             {isCreator ? (
               <button
-                className={`secondary-button ${inviteFeedback !== "idle" ? "button-success" : ""}`}
-                onClick={handleShareInvite}
+                className={`vault-action-btn vault-invite-btn ${inviteFeedback !== "idle" ? "button-success" : ""}`}
+                onClick={() => setShowInviteModal(true)}
                 ref={inviteTriggerRef}
                 type="button"
+                title={t("invitePartner")}
               >
-                {inviteFeedback === "shared"
-                  ? t("inviteShared")
-                  : inviteFeedback === "copied"
-                    ? t("inviteCopiedSend")
-                    : typeof navigator.share === "function"
-                      ? t("sendInvite")
-                      : t("inviteOne")}
+                <span className="btn-icon" aria-hidden="true">🔑</span>
+                <span>{t("invitePartner")}</span>
+                {invites.filter((i) => !i.revokedAt).length > 0 && (
+                  <span className="vault-badge-count">{invites.filter((i) => !i.revokedAt).length}</span>
+                )}
               </button>
             ) : (
               <button
-                className={`secondary-button ${copyFeedback === "success" ? "button-success" : ""}`}
+                className={`vault-action-btn ${copyFeedback === "success" ? "button-success" : ""}`}
                 onClick={handleCopyLink}
                 type="button"
               >
                 {copyFeedback === "success" ? t("copied") : t("copyMyLink")}
               </button>
             )}
-            <button
-              className={`secondary-button ${destroyFeedback === "success" ? "button-success" : ""}`}
-              disabled={!creatorToken || destroying || room?.status !== "open"}
-              onClick={handleDestroy}
-              type="button"
-            >
-              {destroying ? t("destroying") : t("destroy")}
-            </button>
+            {isCreator ? (
+              <button
+                className="vault-action-btn vault-security-btn"
+                onClick={() => setShowSecurityModal(true)}
+                type="button"
+                title="Room Security & Access Code"
+              >
+                <span className="btn-icon" aria-hidden="true">🛡️</span>
+                <span>Security</span>
+                {room?.accessCodeProtected && (
+                  <span className="vault-badge-secure" title="Protected by Access Code">PIN</span>
+                )}
+              </button>
+            ) : null}
+            {isCreator ? (
+              <button
+                className={`vault-action-btn vault-danger-btn ${destroyFeedback === "success" ? "button-success" : ""}`}
+                disabled={!creatorToken || destroying || room?.status !== "open"}
+                onClick={handleDestroy}
+                type="button"
+                title="Permanently wipe vault"
+              >
+                {destroying ? t("destroying") : t("destroy")}
+              </button>
+            ) : (
+              <button
+                className="vault-action-btn vault-danger-btn"
+                onClick={() => {
+                  if (window.confirm(t("leaveConfirm"))) {
+                    window.location.assign("/");
+                  }
+                }}
+                type="button"
+                title="Leave private conversation"
+              >
+                {t("leaveRoom")}
+              </button>
+            )}
           </div>
-          <span className="sr-only" role="status" aria-live="polite">
-            {inviteFeedback === "shared"
-              ? t("inviteSharedStatus")
-              : inviteFeedback === "copied"
-                ? t("inviteCopiedStatus")
-                : copyFeedback === "success"
-                  ? t("roomLinkCopiedStatus")
-                  : ""}
-          </span>
         </div>
+
+        <div className="vault-header-sub">
+          <div className="vault-presence-cluster" aria-live="polite" ref={setRetryFocusTarget} tabIndex={-1}>
+            <span className={`vault-conn-pill ${connection === t("connected") ? "is-connected" : "is-connecting"}`}>
+              <span className="conn-dot" aria-hidden="true" />
+              {connection}
+            </span>
+            <div className="vault-presence-duo" aria-label="Presence Status">
+              <span className="presence-agent you active" title="Your presence">
+                <span className="agent-indicator" aria-hidden="true" /> {t("you")}
+              </span>
+              <span className="presence-separator" aria-hidden="true">·</span>
+              <span className={`presence-agent partner ${presentCount >= 2 ? "active" : "waiting"}`} title={presentCount >= 2 ? "Partner connected" : "Awaiting partner"}>
+                <span className="agent-indicator" aria-hidden="true" /> {presentCount >= 2 ? t("partnerPresent") : t("waitingForPartner")}
+              </span>
+              {isCreator && sortedPresenceIds.some((id) => id !== sessionId) && (
+                <button
+                  className="vault-kick-btn"
+                  onClick={() => {
+                    const guestId = sortedPresenceIds.find((id) => id !== sessionId);
+                    if (guestId) handleKickParticipant(guestId);
+                  }}
+                  title={t("remove")}
+                  type="button"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="vault-security-pills" aria-label="Security policy">
+            <span className="security-pill">🛡️ {t("e2eEncrypted")}</span>
+            <span className="security-pill">⏱️ {messagePolicyLabel}</span>
+            <span className="security-pill">⌛ {roomPolicyLabel}</span>
+          </div>
+        </div>
+
+        <span className="sr-only" role="status" aria-live="polite">
+          {inviteFeedback === "shared"
+            ? t("inviteSharedStatus")
+            : inviteFeedback === "copied"
+              ? t("inviteCopiedStatus")
+              : copyFeedback === "success"
+                ? t("roomLinkCopiedStatus")
+                : ""}
+        </span>
       </header>
 
-      <section className="room-strip">
-        <div className="participant-strip" aria-label={t("participants")}>
-          {sortedPresenceIds.length === 0 ? (
-            <span className="participant-empty">{t("waiting")}</span>
-          ) : (
-            sortedPresenceIds.map((id) => (
-              <span
-                className={`participant-chip ${id === sessionId ? "participant-chip-self" : ""}`}
-                key={id}
-                style={{ "--participant-color": colorFromSessionId(id) } as CSSProperties}
+      {showInviteModal && (
+        <div
+          className="vault-modal-backdrop"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowInviteModal(false);
+          }}
+        >
+          <div className="vault-modal" role="dialog" aria-modal="true" aria-labelledby="invite-modal-title">
+            <div className="vault-modal-header">
+              <div className="modal-title-cluster">
+                <span className="modal-key-icon" aria-hidden="true">🔑</span>
+                <div>
+                  <h2 id="invite-modal-title">{t("inviteModalTitle")}</h2>
+                  <p className="modal-sub">{t("inviteModalSub")}</p>
+                </div>
+              </div>
+              <button
+                className="modal-close-btn"
+                onClick={() => setShowInviteModal(false)}
+                type="button"
+                aria-label="Close modal"
               >
-                <span className="participant-dot" />
-                {id === sessionId ? t("you") : t("guest")}
-                {isCreator && id !== sessionId ? (
+                ✕
+              </button>
+            </div>
+
+            <div className="vault-modal-body">
+              {isCreator ? (
+                <div className="invite-generator-panel">
+                  <div className="invite-duration-row">
+                    <span className="setting-label">{t("newInviteExpires")}</span>
+                    <div className="setting-controls">
+                      <input
+                        aria-label={t("inviteLifetimeAmount")}
+                        className="setting-input modal-input"
+                        inputMode="numeric"
+                        min="1"
+                        onChange={(event) =>
+                          setInviteDuration((current) => ({ ...current, amount: event.target.value }))
+                        }
+                        type="number"
+                        value={inviteDuration.amount}
+                      />
+                      <select
+                        aria-label={t("inviteLifetimeUnit")}
+                        className="setting-select modal-select"
+                        onChange={(event) =>
+                          setInviteDuration((current) => ({
+                            ...current,
+                            unit: event.target.value as DurationUnit
+                          }))
+                        }
+                        value={inviteDuration.unit}
+                      >
+                        <option value="minutes">{t("minutes")}</option>
+                        <option value="hours">{t("hours")}</option>
+                        <option value="days">{t("days")}</option>
+                      </select>
+                    </div>
+                  </div>
+
                   <button
-                    className="participant-kick"
-                    onClick={() => handleKickParticipant(id)}
+                    className={`primary-button modal-generate-btn ${inviteFeedback !== "idle" ? "button-success" : ""}`}
+                    onClick={handleShareInvite}
                     type="button"
                   >
-                    {t("remove")}
+                    {inviteFeedback === "shared"
+                      ? t("inviteShared")
+                      : inviteFeedback === "copied"
+                        ? t("inviteCopiedSend")
+                        : typeof navigator.share === "function"
+                          ? t("sendInvite")
+                          : t("inviteOne")}
                   </button>
-                ) : null}
-              </span>
-            ))
-          )}
-        </div>
-        <div className="banner-stats">
-          <span>{room?.status ?? "loading"}</span>
-        </div>
-      </section>
+                </div>
+              ) : null}
 
-      {isCreator ? (
-        <section className="invite-settings" aria-label={t("inviteExpiration")}>
-          <div>
-            <span className="setting-label">{t("newInviteExpires")}</span>
-            <p className="setting-note">
-              {t("inviteNextOnly")}
-            </p>
-          </div>
-          <div className="setting-controls">
-            <input
-              aria-label={t("inviteLifetimeAmount")}
-              className="setting-input"
-              inputMode="numeric"
-              min="1"
-              onChange={(event) =>
-                setInviteDuration((current) => ({ ...current, amount: event.target.value }))
-              }
-              type="number"
-              value={inviteDuration.amount}
-            />
-            <select
-              aria-label={t("inviteLifetimeUnit")}
-              className="setting-select"
-              onChange={(event) =>
-                setInviteDuration((current) => ({
-                  ...current,
-                  unit: event.target.value as DurationUnit
-                }))
-              }
-              value={inviteDuration.unit}
-            >
-              <option value="minutes">{t("minutes")}</option>
-              <option value="hours">{t("hours")}</option>
-              <option value="days">{t("days")}</option>
-            </select>
-          </div>
-        </section>
-      ) : null}
+              {showManualInvite && manualInvite ? (
+                <div className="modal-manual-wrapper">
+                  <ManualInviteLink
+                    key={manualInvite.token}
+                    url={buildInviteUrl(roomId, manualInvite.token, roomSecret)}
+                    trigger={manualInvite.trigger}
+                    focusOwner={manualInvite.focusOwner}
+                    fallbackTrigger={inviteTriggerRef.current}
+                    onDismiss={dismissManualInvite}
+                  />
+                </div>
+              ) : null}
 
-      {isInviteGuest ? <MakeYourOwnCallout compact /> : null}
-      {roomNotice ? (
-        <p className="room-notice" role="status" aria-live="polite">
-          {roomNotice}
-        </p>
-      ) : null}
-      {error ? <p className="error-text room-error" role="alert">{error}</p> : null}
-      {connectionError ? <p className="error-text room-error" role="alert">{connectionError}</p> : null}
-      {isCreator && invites.length > 0 ? (
-        <section className="invite-panel">
-          <span className="eyebrow">{t("invites")}</span>
-          <p className="invite-guidance">
-            {t("inviteGuidance")}
-          </p>
-          {showManualInvite && manualInvite ? (
-            <ManualInviteLink key={manualInvite.token} url={buildInviteUrl(roomId, manualInvite.token, roomSecret)}
-              trigger={manualInvite.trigger} focusOwner={manualInvite.focusOwner} fallbackTrigger={inviteTriggerRef.current} onDismiss={dismissManualInvite} />
-          ) : null}
-          {invites.slice(0, 4).map((invite) => (
-            <div className="invite-row" key={invite.token} style={inviteAccentStyle(invite)}>
-              <span>{inviteStatusLabel(invite)}</span>
-              <div className="invite-actions">
-                {canShareInvite(invite, now) ? (
-                  <>
-                    {typeof navigator.share === "function" ? (
-                      <button
-                        className="secondary-button invite-copy"
-                        onClick={(event) => handleNativeShareInvite(invite.token, event.currentTarget)}
-                        type="button"
-                      >
-                        {t("share")}
-                      </button>
-                    ) : null}
-                    <button className="secondary-button invite-copy" onClick={(event) => handleCopyInvite(invite.token, event.currentTarget)} type="button">
-                      {t("copyInvite")}
-                    </button>
-                  </>
-                ) : null}
-                {!invite.revokedAt ? (
-                  <button className="secondary-button invite-revoke" onClick={() => handleRevokeInvite(invite.token)} type="button">
-                    {t("remove")}
-                  </button>
-                ) : null}
-              </div>
+              {isCreator && invites.length > 0 ? (
+                <div className="vault-invites-block">
+                  <span className="eyebrow">{t("activePasses")} ({invites.length})</span>
+                  <div className="vault-invites-scroll">
+                    {invites.slice(0, 6).map((invite) => (
+                      <div className="invite-row vault-invite-row" key={invite.token} style={inviteAccentStyle(invite)}>
+                        <div className="vault-invite-meta">
+                          <span className="invite-tag">{inviteStatusLabel(invite)}</span>
+                          <span className="invite-token-code">Token: {invite.token.slice(0, 8)}...</span>
+                        </div>
+                        <div className="invite-actions">
+                          {canShareInvite(invite, now) ? (
+                            <>
+                              {typeof navigator.share === "function" ? (
+                                <button
+                                  className="secondary-button invite-copy"
+                                  onClick={(event) => handleNativeShareInvite(invite.token, event.currentTarget)}
+                                  type="button"
+                                >
+                                  {t("share")}
+                                </button>
+                              ) : null}
+                              <button
+                                className="secondary-button invite-copy"
+                                onClick={(event) => handleCopyInvite(invite.token, event.currentTarget)}
+                                type="button"
+                              >
+                                {t("copyInvite")}
+                              </button>
+                            </>
+                          ) : null}
+                          {!invite.revokedAt ? (
+                            <button
+                              className="secondary-button invite-revoke"
+                              onClick={() => handleRevokeInvite(invite.token)}
+                              type="button"
+                            >
+                              {t("remove")}
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
             </div>
-          ))}
-        </section>
+
+            <div className="vault-modal-footer">
+              <p className="modal-security-note">
+                🛡️ Pass admits one participant and expires after single use.
+              </p>
+              <button
+                className="secondary-button modal-done-btn"
+                onClick={() => setShowInviteModal(false)}
+                type="button"
+              >
+                {t("done")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {roomNotice ? (
+        <div className="vault-toast-banner" role="status" aria-live="polite">
+          {roomNotice}
+        </div>
       ) : null}
+      {error ? <div className="vault-toast-banner error-text" role="alert">{error}</div> : null}
+      {connectionError ? <div className="vault-toast-banner error-text" role="alert">{connectionError}</div> : null}
 
       {conversationFind.controls}
+
       <section className="chat-stage">
-        <section aria-label={t("conversationLog")} aria-live="polite" aria-relevant="additions" className="chat-log" ref={chatLogRef} role="log" tabIndex={0} onScroll={handleConversationScroll}>
-        <div className="chat-thread">
-          {!ready ? <p className="system-line">{t("deriving")}</p> : null}
-          {messages.length === 0 && ready ? (
-            <p className="system-line">{messagePolicyLabel}</p>
-          ) : null}
-          {messages.map((message) => {
-            const mine = message.senderSessionId === sessionId;
-            return (
-              <article
-                className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}${conversationFind.selectedId === message.id ? " bubble-find-selected" : ""}`}
-                data-message-id={message.id}
-                key={message.id}
-                style={bubbleStyle(message.senderSessionId, mine)}
-              >
-                <span className="bubble-author">{mine ? t("you") : t("guest")}</span>
-                {message.kind === "file" && message.file ? (
-                  <FileCard
-                    file={message.file}
-                    onDownload={() =>
-                      handleRequestFile(message.file!.fileId, message.senderSessionId)
-                    }
-                  />
-                ) : (
-                  <p>{message.plaintext}</p>
-                )}
-                <footer>
-                  <span>{formatClock(message.sentAt)}</span>
-                  <span>{messageStatus(message)}</span>
-                </footer>
-              </article>
-            );
-          })}
-        </div>
+        <section
+          aria-label={t("conversationLog")}
+          aria-live="polite"
+          aria-relevant="additions"
+          className="chat-log"
+          ref={chatLogRef}
+          role="log"
+          tabIndex={0}
+          onScroll={handleConversationScroll}
+        >
+          <div className="chat-thread">
+            {isInviteGuest && messages.length === 0 ? <MakeYourOwnCallout compact /> : null}
+            {!ready ? <p className="system-line">{t("deriving")}</p> : null}
+            {messages.length === 0 && ready ? (
+              <div className="vault-empty-state">
+                <span className="empty-glyph" aria-hidden="true">🔒</span>
+                <p className="empty-title">Encrypted Vault Channel Active</p>
+                <p className="empty-desc">{messagePolicyLabel}</p>
+              </div>
+            ) : null}
+            {messages.map((message) => {
+              const mine = message.senderSessionId === sessionId;
+              return (
+                <article
+                  className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}${conversationFind.selectedId === message.id ? " bubble-find-selected" : ""}`}
+                  data-message-id={message.id}
+                  key={message.id}
+                  style={bubbleStyle(message.senderSessionId, mine)}
+                >
+                  <span className="bubble-author">{mine ? t("you") : t("guest")}</span>
+                  {message.kind === "file" && message.file ? (
+                    <FileCard
+                      file={message.file}
+                      onDownload={() =>
+                        handleRequestFile(message.file!.fileId, message.senderSessionId)
+                      }
+                    />
+                  ) : (
+                    <p className="bubble-content">{message.plaintext}</p>
+                  )}
+                  <footer className="bubble-footer">
+                    <span className="bubble-timestamp">{formatClock(message.sentAt)}</span>
+                    {mine && (
+                      <span
+                        className={
+                          message.deliveryStatus === "seen"
+                            ? "bubble-seen-status"
+                            : message.deliveryStatus === "delivered"
+                            ? "bubble-delivered-status"
+                            : "bubble-sent-status"
+                        }
+                        title={
+                          message.deliveryStatus === "seen"
+                            ? "Rendered in recipient's active viewport"
+                            : message.deliveryStatus === "delivered"
+                            ? "Delivered and decrypted by recipient"
+                            : "Sent to room relay"
+                        }
+                      >
+                        {message.deliveryStatus === "seen"
+                          ? "✓✓ " + t("seen")
+                          : message.deliveryStatus === "delivered"
+                          ? "✓ " + t("delivered")
+                          : "○ " + t("sent")}
+                      </span>
+                    )}
+                    <span className="bubble-vanish-status" title="Message lifetime">
+                      <span aria-hidden="true">⏱ </span>{messageStatus(message)}
+                    </span>
+                  </footer>
+                </article>
+              );
+            })}
+          </div>
         </section>
+
         {awayFromLatest ? (
           <button
             className="secondary-button jump-to-latest"
@@ -2860,40 +3678,77 @@ function RoomPage({ roomId }: { roomId: string }) {
         ) : null}
       </section>
 
-      <form className="composer" onSubmit={handleSend}>
-        <button
-          aria-label={t("attachFileLabel")}
-          className="secondary-button composer-attach"
-          disabled={room?.status !== "open" || !keyReady}
-          onClick={() => fileInputRef.current?.click()}
-          title={t("attachFile")}
-          type="button"
-        >
-          &#128206;
-        </button>
-        <input
-          hidden
-          multiple
-          onChange={(event) => void handleAttachFiles(event.target.files)}
-          ref={fileInputRef}
-          type="file"
-        />
-        <textarea
-          aria-label={t("writeMessageLabel")}
-          value={draft}
-          onChange={(event) => {
-            draftRevisionRef.current += 1;
-            setDraft(event.target.value);
-          }}
-          onKeyDown={handleComposerKeyDown}
-          disabled={room?.status !== "open" || !keyReady}
-          placeholder={room?.status === "open" ? (keyReady ? t("writeMessage") : t("securing")) : roomNotice ?? t("roomClosed")}
-          rows={3}
-        />
-        <button className="primary-button" type="submit" disabled={sending || !draft.trim() || room?.status !== "open" || !keyReady}>
-          {t("sendEncrypted")}
-        </button>
+      <form className="composer composer-vault" onSubmit={handleSend}>
+        <div className="composer-meta-bar">
+          <span className="composer-enc-badge">
+            <span className="composer-shield-icon" aria-hidden="true">🛡️</span>
+            {t("encryptionNotice")}
+          </span>
+          <span className="composer-hint">Enter ↵ to send · Shift+Enter for newline</span>
+        </div>
+        <div className="composer-input-row">
+          <button
+            aria-label={t("attachFileLabel")}
+            className="secondary-button composer-attach"
+            disabled={room?.status !== "open" || !keyReady}
+            onClick={() => fileInputRef.current?.click()}
+            title={t("attachFile")}
+            type="button"
+          >
+            📎
+          </button>
+          <input
+            hidden
+            multiple
+            onChange={(event) => void handleAttachFiles(event.target.files)}
+            ref={fileInputRef}
+            type="file"
+          />
+          <textarea
+            aria-label={t("writeMessageLabel")}
+            value={draft}
+            onChange={(event) => {
+              draftRevisionRef.current += 1;
+              setDraft(event.target.value);
+            }}
+            onKeyDown={handleComposerKeyDown}
+            disabled={room?.status !== "open" || !keyReady}
+            placeholder={room?.status === "open" ? (keyReady ? t("writeMessage") : t("securing")) : roomNotice ?? t("roomClosed")}
+            rows={2}
+          />
+          <button
+            className="primary-button composer-send-btn"
+            type="submit"
+            disabled={sending || !draft.trim() || room?.status !== "open" || !keyReady}
+            title={t("sendEncrypted")}
+          >
+            <span className="send-text">{t("sendEncrypted")}</span>
+            <span className="send-icon" aria-hidden="true">↑</span>
+          </button>
+        </div>
       </form>
+      {showSecurityModal && creatorToken ? (
+        <RoomSecurityModal
+          roomId={roomId}
+          creatorToken={creatorToken}
+          room={room}
+          invites={invites}
+          knownAccessCode={knownAccessCode}
+          presenceCount={presence.count}
+          onClose={() => setShowSecurityModal(false)}
+          onUpdateCode={(code, enabled) => {
+            if (code) {
+              safeStorageSet("session", `elm-chat:access-code:${roomId}`, code);
+              setKnownAccessCode(code);
+            } else if (enabled === false) {
+              safeStorageRemove("session", `elm-chat:access-code:${roomId}`);
+              setKnownAccessCode(undefined);
+            }
+            setRoom((prev) => prev ? { ...prev, accessCodeProtected: enabled ?? prev.accessCodeProtected } : prev);
+          }}
+          onRevokeInvite={handleRevokeInvite}
+        />
+      ) : null}
     </main>
   );
 }

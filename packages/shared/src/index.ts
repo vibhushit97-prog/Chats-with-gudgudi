@@ -99,6 +99,8 @@ export interface CreateRoomRequest {
   maxAgeMs?: number | null;
   acquisitionSource?: AcquisitionSource;
   turnstileToken?: string;
+  accessCode?: string | null;
+  generateAccessCode?: boolean;
 }
 
 export interface CreateRoomResponse {
@@ -111,6 +113,8 @@ export interface CreateRoomResponse {
   maxAgeMs: number | null;
   disappearAfterReadSeconds: number | null;
   creatorToken: string;
+  accessCode?: string;
+  accessCodeProtected?: boolean;
 }
 
 export interface RoomMetadata {
@@ -126,6 +130,8 @@ export interface RoomMetadata {
   lastActivityAt: number;
   membershipVersion: number;
   destroyedAt?: number;
+  accessCodeProtected?: boolean;
+  accessCodeVerified?: boolean;
 }
 
 export interface EncryptedMessageEnvelope {
@@ -159,6 +165,33 @@ export interface JoinPayload {
   agreementKey: string;
   creatorToken?: string;
   inviteToken?: string;
+  accessCodeTicket?: string;
+}
+
+export interface AccessCodeManageRequest {
+  action: "set" | "generate" | "revoke" | "disable";
+  code?: string;
+}
+
+export interface AccessCodeManageResponse {
+  ok: boolean;
+  enabled: boolean;
+  code?: string;
+  guestVerified?: boolean;
+}
+
+export interface AccessCodeVerifyRequest {
+  inviteToken?: string;
+  accessCode: string;
+}
+
+export interface AccessCodeVerifyResponse {
+  ok: boolean;
+  ticket?: string;
+  error?: string;
+  code?: string;
+  retryAfterSeconds?: number;
+  remainingAttempts?: number;
 }
 
 export interface AuthenticatedPeerEvent {
@@ -176,6 +209,23 @@ export interface PeerDataRelayPayload {
   type: "peer_data";
   toSessionId?: string;
   data: AuthenticatedPeerEvent;
+}
+
+export type MessageDeliveryStatus = "sent" | "delivered" | "seen" | "destroyed";
+
+export interface MessageDeliveredPayload {
+  type: "message_delivered";
+  messageId: string;
+}
+
+export interface MessageSeenPayload {
+  type: "message_seen";
+  messageId: string;
+}
+
+export interface DestroyMessagePayload {
+  type: "destroy_message";
+  messageId: string;
 }
 
 export interface DestroyPayload {
@@ -196,6 +246,9 @@ export interface KickParticipantPayload {
 export type ClientEvent =
   | JoinPayload
   | PeerDataRelayPayload
+  | MessageDeliveredPayload
+  | MessageSeenPayload
+  | DestroyMessagePayload
   | KickParticipantPayload
   | DestroyPayload
   | PingPayload;
@@ -246,6 +299,27 @@ export interface ParticipantKickedEvent {
   reason?: string;
 }
 
+export interface MessageDeliveredEvent {
+  type: "message_delivered";
+  messageId: string;
+  deliveredAt: number;
+}
+
+export interface MessageSeenEvent {
+  type: "message_seen";
+  messageId: string;
+  seenAt: number;
+  seenBySessionId: string;
+  destroyedAt?: number;
+}
+
+export interface MessageDestroyedEvent {
+  type: "message_destroyed";
+  messageId: string;
+  destroyedAt: number;
+  reason?: "seen" | "expired" | "manual";
+}
+
 export interface ErrorEventPayload {
   type: "error";
   code: string;
@@ -260,6 +334,9 @@ export type ServerEvent =
   | PeerDataRelayEvent
   | ParticipantKickedEvent
   | RoomStateEvent
+  | MessageDeliveredEvent
+  | MessageSeenEvent
+  | MessageDestroyedEvent
   | ErrorEventPayload;
 
 export interface RoomInvite {

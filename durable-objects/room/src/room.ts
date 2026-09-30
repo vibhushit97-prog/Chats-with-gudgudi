@@ -2,11 +2,22 @@ import {
   DEFAULT_DISAPPEAR_AFTER_READ_SECONDS,
   DEFAULT_INACTIVITY_TIMEOUT_MS,
   MAX_CONNECTIONS_PER_ROOM,
+  type AccessCodeManageRequest,
+  type AccessCodeManageResponse,
+  type AccessCodeVerifyRequest,
+  type AccessCodeVerifyResponse,
   type ClientEvent,
   type CreateRoomResponse,
+  type DestroyMessagePayload,
   type ErrorEventPayload,
   type JoinPayload,
   type KickParticipantPayload,
+  type MessageDeliveredEvent,
+  type MessageDeliveredPayload,
+  type MessageDestroyedEvent,
+  type MessageDeliveryStatus,
+  type MessageSeenEvent,
+  type MessageSeenPayload,
   type ParticipantKickedEvent,
   type PeerDataRelayEvent,
   type PeerDataRelayPayload,
@@ -20,12 +31,39 @@ import {
   type RoomStateEvent,
   type ServerEvent
 } from "@elm-chat/shared";
+import {
+  base64UrlToBytes,
+  bytesToBase64Url,
+  generateAccessCode,
+  hashAccessCode,
+  verifyAccessCode
+} from "@elm-chat/crypto";
 import { DurableObject } from "cloudflare:workers";
 import { roomExpiryReason } from "./expiry";
 
 type RoomStorage = RoomMetadata & {
   creatorToken: string;
 };
+
+interface AccessCodeStorage {
+  enabled: boolean;
+  revoked?: boolean;
+  saltBase64Url: string;
+  hashBase64Url: string;
+}
+
+export interface RoomMessageRecord {
+  messageId: string;
+  senderSessionId: string;
+  sentAt: number;
+  status: MessageDeliveryStatus;
+  expiresAfterReadSeconds: number | null;
+  fallbackExpiresAt: number;
+  deliveredAt?: number;
+  seenAt?: number;
+  seenBySessionId?: string;
+  destroyedAt?: number;
+}
 
 // Stored on each accepted WebSocket via serializeAttachment. This survives
 // Durable Object hibernation, so it — not an in-memory map — is the source of
@@ -48,7 +86,10 @@ type RoomBootstrap = Pick<
   | "maxAgeMs"
   | "disappearAfterReadSeconds"
   | "creatorToken"
->;
+> & {
+  accessCode?: string | null;
+  generateAccessCode?: boolean;
+};
 
 export interface Env {
   GROWTH?: AnalyticsEngineDataset;
@@ -57,6 +98,9 @@ export interface Env {
 
 const ROOM_META_KEY = "room:meta";
 const INVITES_KEY = "room:invites";
+const MESSAGES_KEY = "room:messages";
+const DESTROYED_MESSAGES_KEY = "room:destroyed_messages";
+const ACCESS_CODE_KEY = "room:access_code";
 const DEFAULT_INVITE_TTL_MS = 10 * 60 * 1000;
 const JOIN_TIMEOUT_MS = 15 * 1000;
 
@@ -92,6 +136,15 @@ async function safeJson<T>(request: Request): Promise<T> {
 export class RoomDurableObject extends DurableObject<Env> {
   private roomMeta: RoomStorage | null = null;
   private invites = new Map<string, RoomInvite>();
+  private messages = new Map<string, RoomMessageRecord>();
+  private destroyedMessageIds = new Set<string>();
+  private accessCodeConfig: AccessCodeStorage | null = null;
+  private lastGeneratedCode?: string;
+  private failedAttempts = 0;
+  private lockedUntil = 0;
+  private guestVerified = false;
+  private validTickets = new Map<string, { createdAt: number; expiresAt: number; inviteToken?: string }>();
+  private verifiedSessionIds = new Set<string>();
   private storageReady: Promise<void>;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -102,6 +155,9 @@ export class RoomDurableObject extends DurableObject<Env> {
         this.roomMeta.membershipVersion = 0;
       }
       this.invites = new Map((await this.ctx.storage.get<[string, RoomInvite][]>(INVITES_KEY)) ?? []);
+      this.messages = new Map((await this.ctx.storage.get<[string, RoomMessageRecord][]>(MESSAGES_KEY)) ?? []);
+      this.destroyedMessageIds = new Set((await this.ctx.storage.get<string[]>(DESTROYED_MESSAGES_KEY)) ?? []);
+      this.accessCodeConfig = (await this.ctx.storage.get<AccessCodeStorage>(ACCESS_CODE_KEY)) ?? null;
     });
   }
 
@@ -136,6 +192,24 @@ export class RoomDurableObject extends DurableObject<Env> {
     if (request.method === "POST" && url.pathname === "/internal/invites/revoke") {
       const payload = await safeJson<{ creatorToken: string; token: string }>(request);
       return this.revokeInvite(payload.creatorToken, payload.token);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/access-code") {
+      const creatorToken =
+        request.headers.get("authorization")?.match(/^Bearer ([A-Za-z0-9_-]+)$/i)?.[1] ?? "";
+      const payload = await safeJson<AccessCodeManageRequest & { creatorToken?: string }>(request);
+      return this.handleManageAccessCode(creatorToken || payload.creatorToken || "", payload);
+    }
+
+    if (request.method === "GET" && url.pathname === "/internal/access-code") {
+      const creatorToken =
+        request.headers.get("authorization")?.match(/^Bearer ([A-Za-z0-9_-]+)$/i)?.[1] ?? "";
+      return this.handleGetAccessCode(creatorToken);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/access-code/verify") {
+      const payload = await safeJson<AccessCodeVerifyRequest>(request);
+      return this.handleVerifyAccessCode(payload);
     }
 
     if (request.method === "GET" && url.pathname === "/ws") {
@@ -178,6 +252,16 @@ export class RoomDurableObject extends DurableObject<Env> {
         socket.close(4408, "join timeout");
       }
     }
+    for (const [id, record] of [...this.messages.entries()]) {
+      if (record.status === "seen") {
+        const delaySec = record.expiresAfterReadSeconds ?? this.roomMeta?.disappearAfterReadSeconds ?? 0;
+        if (record.seenAt && record.seenAt + delaySec * 1000 <= now) {
+          await this.destroyMessage(id, "seen");
+        }
+      } else if (record.fallbackExpiresAt <= now) {
+        await this.destroyMessage(id, "expired");
+      }
+    }
     await this.scheduleNextAlarm();
   }
 
@@ -214,6 +298,15 @@ export class RoomDurableObject extends DurableObject<Env> {
         break;
       case "peer_data":
         await this.handlePeerData(ws, parsed);
+        break;
+      case "message_delivered":
+        await this.handleMessageDelivered(ws, parsed);
+        break;
+      case "message_seen":
+        await this.handleMessageSeen(ws, parsed);
+        break;
+      case "destroy_message":
+        await this.handleDestroyMessage(ws, parsed);
         break;
       case "destroy":
         await this.destroyRoom("destroyed", parsed.creatorToken);
@@ -253,6 +346,23 @@ export class RoomDurableObject extends DurableObject<Env> {
       return jsonResponse({ error: "Room already initialized." }, 409);
     }
 
+    if (bootstrap.generateAccessCode || bootstrap.accessCode) {
+      let code = bootstrap.accessCode;
+      if (!code || bootstrap.generateAccessCode) {
+        code = generateAccessCode();
+      }
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const hash = await hashAccessCode(code, salt);
+      this.accessCodeConfig = {
+        enabled: true,
+        revoked: false,
+        saltBase64Url: bytesToBase64Url(salt),
+        hashBase64Url: bytesToBase64Url(hash)
+      };
+      await this.ctx.storage.put(ACCESS_CODE_KEY, this.accessCodeConfig);
+      this.lastGeneratedCode = code;
+    }
+
     const meta: RoomStorage = {
       roomId: bootstrap.roomId,
       createdAt: bootstrap.createdAt,
@@ -272,7 +382,7 @@ export class RoomDurableObject extends DurableObject<Env> {
     this.roomMeta = meta;
     await this.ctx.storage.put(ROOM_META_KEY, meta);
     await this.scheduleNextAlarm();
-    return jsonResponse(this.publicMetadata(meta), 201);
+    return jsonResponse({ ...this.publicMetadata(meta), accessCode: this.lastGeneratedCode }, 201);
   }
 
   private handleMetadata(): Response {
@@ -326,7 +436,34 @@ export class RoomDurableObject extends DurableObject<Env> {
       return;
     }
 
+    const currentSessions = this.connectedSessions().filter((s) => s.sessionId !== payload.sessionId);
+    if (currentSessions.length >= 2) {
+      ws.send(JSON.stringify(errorEvent("room_full", "The room has reached maximum capacity of 2 participants.")));
+      ws.close(4409, "room full");
+      return;
+    }
+
     const creator = payload.creatorToken === this.roomMeta.creatorToken;
+
+    const isAccessCodeProtected = Boolean(this.accessCodeConfig?.enabled && !this.accessCodeConfig?.revoked);
+    if (!creator && isAccessCodeProtected) {
+      const isReconnectingAdmittedSession =
+        this.verifiedSessionIds.has(payload.sessionId) &&
+        Boolean(payload.inviteToken && this.invites.get(payload.inviteToken)?.consumedBySessionId === payload.sessionId);
+
+      if (!isReconnectingAdmittedSession) {
+        const ticket = payload.accessCodeTicket;
+        const ticketRecord = ticket ? this.validTickets.get(ticket) : undefined;
+        if (!ticket || !ticketRecord || ticketRecord.expiresAt <= Date.now()) {
+          ws.send(JSON.stringify(errorEvent("access_code_required", "Room access code verification required.")));
+          ws.close(4403, "access code required");
+          return;
+        }
+        this.validTickets.delete(ticket);
+        this.verifiedSessionIds.add(payload.sessionId);
+      }
+    }
+
     const admission = await this.reserveInviteForJoin(creator, payload);
     if (!admission.ok) {
       ws.send(JSON.stringify(errorEvent(admission.code, admission.message)));
@@ -472,6 +609,40 @@ export class RoomDurableObject extends DurableObject<Env> {
       return;
     }
 
+    if (data.payload.type === "chat_message") {
+      const envelope = (data.payload as { envelope?: { messageId?: string; senderSessionId?: string; sentAt?: number; expiresAfterReadSeconds?: number | null } }).envelope;
+      if (
+        envelope &&
+        typeof envelope.messageId === "string" &&
+        /^[0-9a-f-]{36}$/i.test(envelope.messageId) &&
+        envelope.senderSessionId === attachment.sessionId
+      ) {
+        if (this.destroyedMessageIds.has(envelope.messageId)) {
+          return;
+        }
+        if (!this.messages.has(envelope.messageId)) {
+          const fallbackExpiresAt = this.roomMeta.expiresAt ?? (envelope.sentAt! + (this.roomMeta.maxAgeMs ?? 24 * 60 * 60 * 1000));
+          this.messages.set(envelope.messageId, {
+            messageId: envelope.messageId,
+            senderSessionId: attachment.sessionId,
+            sentAt: envelope.sentAt ?? Date.now(),
+            status: "sent",
+            expiresAfterReadSeconds: envelope.expiresAfterReadSeconds ?? null,
+            fallbackExpiresAt
+          });
+          await this.persistMessages();
+        }
+      }
+    }
+
+    if (data.payload.type === "peer_destroy") {
+      for (const id of this.messages.keys()) {
+        this.destroyedMessageIds.add(id);
+      }
+      this.messages.clear();
+      await this.persistMessages();
+    }
+
     const event = {
       type: "peer_data",
       fromSessionId: attachment.sessionId,
@@ -489,6 +660,126 @@ export class RoomDurableObject extends DurableObject<Env> {
     }
 
     await this.markRoomActivity();
+  }
+
+  private async handleMessageDelivered(ws: WebSocket, payload: MessageDeliveredPayload): Promise<void> {
+    const attachment = ws.deserializeAttachment() as AttachmentRecord | null;
+    if (!attachment?.sessionId) return;
+    if (this.destroyedMessageIds.has(payload.messageId)) return;
+    const record = this.messages.get(payload.messageId);
+    if (!record) return;
+    if (record.senderSessionId === attachment.sessionId) return;
+    if (record.status === "sent") {
+      record.status = "delivered";
+      record.deliveredAt = Date.now();
+      await this.persistMessages();
+      this.broadcast({
+        type: "message_delivered",
+        messageId: payload.messageId,
+        deliveredAt: record.deliveredAt
+      } satisfies MessageDeliveredEvent);
+    }
+  }
+
+  private async handleMessageSeen(ws: WebSocket, payload: MessageSeenPayload): Promise<void> {
+    const attachment = ws.deserializeAttachment() as AttachmentRecord | null;
+    if (!attachment?.sessionId) {
+      ws.send(JSON.stringify(errorEvent("join_required", "Join before sending room events.")));
+      return;
+    }
+    if (!payload.messageId || typeof payload.messageId !== "string") {
+      ws.send(JSON.stringify(errorEvent("invalid_event", "Invalid messageId.")));
+      return;
+    }
+    if (this.destroyedMessageIds.has(payload.messageId)) {
+      return;
+    }
+    const record = this.messages.get(payload.messageId);
+    if (!record) {
+      ws.send(JSON.stringify(errorEvent("message_not_found", "Message does not belong to this room.")));
+      return;
+    }
+    if (record.senderSessionId === attachment.sessionId) {
+      ws.send(JSON.stringify(errorEvent("unauthorized_seen", "Cannot mark own message as seen.")));
+      return;
+    }
+    if (record.status === "seen") {
+      return;
+    }
+
+    record.status = "seen";
+    record.seenAt = Date.now();
+    record.seenBySessionId = attachment.sessionId;
+    await this.persistMessages();
+
+    this.broadcast({
+      type: "message_seen",
+      messageId: payload.messageId,
+      seenAt: record.seenAt,
+      seenBySessionId: attachment.sessionId
+    } satisfies MessageSeenEvent);
+
+    const delaySec = record.expiresAfterReadSeconds ?? this.roomMeta?.disappearAfterReadSeconds ?? 0;
+    if (delaySec === 0) {
+      await this.destroyMessage(payload.messageId, "seen");
+    } else {
+      if (delaySec <= 60) {
+        setTimeout(() => {
+          void this.destroyMessage(payload.messageId, "seen");
+        }, delaySec * 1000);
+      }
+      await this.scheduleNextAlarm();
+    }
+  }
+
+  private async handleDestroyMessage(ws: WebSocket, payload: DestroyMessagePayload): Promise<void> {
+    const attachment = ws.deserializeAttachment() as AttachmentRecord | null;
+    if (!attachment?.sessionId) {
+      ws.send(JSON.stringify(errorEvent("join_required", "Join before sending room events.")));
+      return;
+    }
+    if (!payload.messageId || typeof payload.messageId !== "string") {
+      ws.send(JSON.stringify(errorEvent("invalid_event", "Invalid messageId.")));
+      return;
+    }
+    if (this.destroyedMessageIds.has(payload.messageId)) {
+      return;
+    }
+    const record = this.messages.get(payload.messageId);
+    if (!record) {
+      return;
+    }
+    const isSender = record.senderSessionId === attachment.sessionId;
+    const isSeen = record.status === "seen";
+    const isExpired = Date.now() >= record.fallbackExpiresAt;
+    if (!isSender && !isSeen && !isExpired) {
+      ws.send(JSON.stringify(errorEvent("unauthorized_destroy", "Cannot destroy unseen message.")));
+      return;
+    }
+
+    await this.destroyMessage(payload.messageId, isSender ? "manual" : "expired");
+  }
+
+  private async destroyMessage(messageId: string, reason?: "seen" | "expired" | "manual"): Promise<void> {
+    if (this.destroyedMessageIds.has(messageId)) {
+      return;
+    }
+    const record = this.messages.get(messageId);
+    this.messages.delete(messageId);
+    this.destroyedMessageIds.add(messageId);
+    await this.persistMessages();
+
+    this.broadcast({
+      type: "message_destroyed",
+      messageId,
+      destroyedAt: Date.now(),
+      reason
+    } satisfies MessageDestroyedEvent);
+  }
+
+  private async persistMessages(): Promise<void> {
+    await this.ctx.storage.put(MESSAGES_KEY, [...this.messages.entries()]);
+    await this.ctx.storage.put(DESTROYED_MESSAGES_KEY, [...this.destroyedMessageIds]);
   }
 
   private async kickParticipant(ws: WebSocket, payload: KickParticipantPayload): Promise<void> {
@@ -559,6 +850,160 @@ export class RoomDurableObject extends DurableObject<Env> {
     return jsonResponse(invite);
   }
 
+  private async handleManageAccessCode(
+    creatorToken: string,
+    payload: AccessCodeManageRequest
+  ): Promise<Response> {
+    if (!this.roomMeta || this.roomMeta.creatorToken !== creatorToken) {
+      return jsonResponse({ error: "Unauthorized." }, 403);
+    }
+
+    if (payload.action === "revoke") {
+      this.accessCodeConfig = {
+        enabled: true,
+        revoked: true,
+        saltBase64Url: "",
+        hashBase64Url: ""
+      };
+      await this.ctx.storage.put(ACCESS_CODE_KEY, this.accessCodeConfig);
+      this.lastGeneratedCode = undefined;
+      this.validTickets.clear();
+      this.verifiedSessionIds.clear();
+      this.guestVerified = false;
+      return jsonResponse({ ok: true, enabled: false } satisfies AccessCodeManageResponse);
+    }
+
+    if (payload.action === "disable") {
+      this.accessCodeConfig = {
+        enabled: false,
+        revoked: false,
+        saltBase64Url: "",
+        hashBase64Url: ""
+      };
+      await this.ctx.storage.put(ACCESS_CODE_KEY, this.accessCodeConfig);
+      this.lastGeneratedCode = undefined;
+      this.validTickets.clear();
+      this.verifiedSessionIds.clear();
+      this.guestVerified = false;
+      return jsonResponse({ ok: true, enabled: false } satisfies AccessCodeManageResponse);
+    }
+
+    let code = payload.code;
+    if (payload.action === "generate") {
+      code = generateAccessCode();
+    }
+
+    if (!code || !/^\d{6}$/.test(code)) {
+      return jsonResponse({ error: "Access code must be exactly 6 digits." }, 400);
+    }
+
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const hash = await hashAccessCode(code, salt);
+    this.accessCodeConfig = {
+      enabled: true,
+      revoked: false,
+      saltBase64Url: bytesToBase64Url(salt),
+      hashBase64Url: bytesToBase64Url(hash)
+    };
+    await this.ctx.storage.put(ACCESS_CODE_KEY, this.accessCodeConfig);
+    this.lastGeneratedCode = code;
+    this.validTickets.clear();
+    this.verifiedSessionIds.clear();
+    this.guestVerified = false;
+    this.failedAttempts = 0;
+    this.lockedUntil = 0;
+
+    return jsonResponse({
+      ok: true,
+      enabled: true,
+      code,
+      guestVerified: false
+    } satisfies AccessCodeManageResponse);
+  }
+
+  private handleGetAccessCode(creatorToken: string): Response {
+    if (!this.roomMeta || this.roomMeta.creatorToken !== creatorToken) {
+      return jsonResponse({ error: "Unauthorized." }, 403);
+    }
+
+    return jsonResponse({
+      ok: true,
+      enabled: Boolean(this.accessCodeConfig?.enabled && !this.accessCodeConfig?.revoked),
+      code: this.lastGeneratedCode,
+      guestVerified: this.guestVerified
+    } satisfies AccessCodeManageResponse);
+  }
+
+  private async handleVerifyAccessCode(payload: AccessCodeVerifyRequest): Promise<Response> {
+    if (!this.roomMeta || this.roomMeta.status !== "open") {
+      return jsonResponse({ error: "Room is unavailable." }, 410);
+    }
+
+    if (!this.accessCodeConfig || !this.accessCodeConfig.enabled) {
+      return jsonResponse({ ok: true } satisfies AccessCodeVerifyResponse);
+    }
+
+    if (this.accessCodeConfig.revoked) {
+      return jsonResponse({
+        ok: false,
+        error: "Access code has been revoked by the creator."
+      } satisfies AccessCodeVerifyResponse, 403);
+    }
+
+    const now = Date.now();
+    if (this.lockedUntil > now) {
+      const retryAfterSeconds = Math.ceil((this.lockedUntil - now) / 1000);
+      return jsonResponse({
+        ok: false,
+        error: "Too many failed attempts. Temporary lockout in effect.",
+        retryAfterSeconds
+      } satisfies AccessCodeVerifyResponse, 429);
+    }
+
+    if (!payload.inviteToken) {
+      return jsonResponse({ ok: false, error: "Valid invitation token required." } satisfies AccessCodeVerifyResponse, 403);
+    }
+    const invite = this.invites.get(payload.inviteToken);
+    if (!invite || invite.revokedAt || invite.expiresAt <= now) {
+      return jsonResponse({ ok: false, error: "Invitation is invalid or has expired." } satisfies AccessCodeVerifyResponse, 403);
+    }
+
+    const salt = base64UrlToBytes(this.accessCodeConfig.saltBase64Url);
+    const expectedHash = base64UrlToBytes(this.accessCodeConfig.hashBase64Url);
+    const valid = await verifyAccessCode(payload.accessCode || "", salt, expectedHash);
+
+    if (!valid) {
+      this.failedAttempts += 1;
+      if (this.failedAttempts >= 5) {
+        this.lockedUntil = Date.now() + 60_000;
+        this.failedAttempts = 0;
+        return jsonResponse({
+          ok: false,
+          error: "Access Denied. Too many failed attempts. Locked out for 60 seconds.",
+          retryAfterSeconds: 60
+        } satisfies AccessCodeVerifyResponse, 429);
+      }
+      return jsonResponse({
+        ok: false,
+        error: "Access Denied. Incorrect access code.",
+        remainingAttempts: 5 - this.failedAttempts
+      } satisfies AccessCodeVerifyResponse, 401);
+    }
+
+    this.failedAttempts = 0;
+    this.lockedUntil = 0;
+    this.guestVerified = true;
+    const ticketBytes = crypto.getRandomValues(new Uint8Array(32));
+    const ticket = bytesToBase64Url(ticketBytes);
+    this.validTickets.set(ticket, {
+      createdAt: now,
+      expiresAt: now + 5 * 60 * 1000,
+      inviteToken: payload.inviteToken
+    });
+
+    return jsonResponse({ ok: true, ticket } satisfies AccessCodeVerifyResponse);
+  }
+
   private async destroyRoom(reason: string, creatorToken: string): Promise<Response> {
     if (!this.roomMeta) {
       return jsonResponse({ error: "Room not found." }, 404);
@@ -582,6 +1027,9 @@ export class RoomDurableObject extends DurableObject<Env> {
     this.roomMeta.lastActivityAt = Date.now();
     await this.ctx.storage.put(ROOM_META_KEY, this.roomMeta);
     await this.ctx.storage.deleteAlarm();
+
+    this.messages.clear();
+    await this.persistMessages();
 
     this.broadcast({
       type: "room_state",
@@ -626,14 +1074,25 @@ export class RoomDurableObject extends DurableObject<Env> {
         .map((socket) => socket.deserializeAttachment() as AttachmentRecord | null)
         .filter((attachment): attachment is AttachmentRecord => attachment?.sessionId === "")
         .map((attachment) => attachment.connectedAt + JOIN_TIMEOUT_MS)
-    ].filter((value): value is number => typeof value === "number");
+    ];
 
-    if (candidates.length === 0) {
+    for (const record of this.messages.values()) {
+      if (record.status === "seen" && record.seenAt) {
+        const delaySec = record.expiresAfterReadSeconds ?? this.roomMeta.disappearAfterReadSeconds ?? 0;
+        candidates.push(record.seenAt + delaySec * 1000);
+      } else {
+        candidates.push(record.fallbackExpiresAt);
+      }
+    }
+
+    const validCandidates = candidates.filter((value): value is number => typeof value === "number");
+
+    if (validCandidates.length === 0) {
       await this.ctx.storage.deleteAlarm();
       return;
     }
 
-    await this.ctx.storage.setAlarm(Math.min(...candidates));
+    await this.ctx.storage.setAlarm(Math.min(...validCandidates));
   }
 
   private async persistInvites(): Promise<void> {
@@ -779,7 +1238,9 @@ export class RoomDurableObject extends DurableObject<Env> {
       creatorJoined: meta.creatorJoined,
       lastActivityAt: meta.lastActivityAt,
       membershipVersion: meta.membershipVersion,
-      destroyedAt: meta.destroyedAt
+      destroyedAt: meta.destroyedAt,
+      accessCodeProtected: Boolean(this.accessCodeConfig?.enabled && !this.accessCodeConfig?.revoked),
+      accessCodeVerified: this.guestVerified
     };
   }
 }

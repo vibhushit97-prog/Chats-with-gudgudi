@@ -198,10 +198,23 @@ async function handleCreateRoom(request: Request, env: Env): Promise<Response> {
   };
 
   const stub = env.ROOM_OBJECT.getByName(roomId);
-  await stub.fetch("https://room/internal/bootstrap", {
+  const bootstrapRes = await stub.fetch("https://room/internal/bootstrap", {
     method: "POST",
-    body: JSON.stringify(response)
+    body: JSON.stringify({
+      ...response,
+      accessCode: body.accessCode,
+      generateAccessCode: body.generateAccessCode
+    })
   });
+  if (bootstrapRes.ok) {
+    const bootstrapData = (await bootstrapRes.json()) as { accessCode?: string; accessCodeProtected?: boolean };
+    if (bootstrapData.accessCode) {
+      response.accessCode = bootstrapData.accessCode;
+    }
+    if (typeof bootstrapData.accessCodeProtected === "boolean") {
+      response.accessCodeProtected = bootstrapData.accessCodeProtected;
+    }
+  }
 
   recordGrowth(
     env,
@@ -403,6 +416,26 @@ function routeApi(request: Request, env: Env): Promise<Response> {
   const revokeMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/invites\/revoke$/);
   if (revokeMatch && request.method === "POST") {
     return handleRevokeInvite(request, revokeMatch[1], env);
+  }
+
+  const accessVerifyMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/access-code\/verify$/);
+  if (accessVerifyMatch && request.method === "POST") {
+    const stub = env.ROOM_OBJECT.getByName(accessVerifyMatch[1]);
+    return stub.fetch("https://room/internal/access-code/verify", request);
+  }
+
+  const accessManageMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/access-code$/);
+  if (accessManageMatch) {
+    const stub = env.ROOM_OBJECT.getByName(accessManageMatch[1]);
+    if (request.method === "GET") {
+      return stub.fetch("https://room/internal/access-code", {
+        headers: request.headers
+      });
+    }
+    if (request.method === "POST") {
+      return stub.fetch("https://room/internal/access-code", request);
+    }
+    return Promise.resolve(json({ error: "Method not allowed." }, 405));
   }
 
   const match = url.pathname.match(/^\/api\/rooms\/([^/]+)(?:\/(destroy|ws|invites))?$/);
