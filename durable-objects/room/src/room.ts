@@ -960,12 +960,20 @@ export class RoomDurableObject extends DurableObject<Env> {
       } satisfies AccessCodeVerifyResponse, 429);
     }
 
-    if (!payload.inviteToken) {
-      return jsonResponse({ ok: false, error: "Valid invitation token required." } satisfies AccessCodeVerifyResponse, 403);
-    }
-    const invite = this.invites.get(payload.inviteToken);
-    if (!invite || invite.revokedAt || invite.expiresAt <= now) {
-      return jsonResponse({ ok: false, error: "Invitation is invalid or has expired." } satisfies AccessCodeVerifyResponse, 403);
+    if (payload.creatorToken) {
+      if (payload.creatorToken !== this.roomMeta.creatorToken) {
+        return jsonResponse({ ok: false, error: "Unauthorized creator token." } satisfies AccessCodeVerifyResponse, 403);
+      }
+    } else if (payload.inviteToken) {
+      const invite = this.invites.get(payload.inviteToken);
+      if (!invite || invite.revokedAt || invite.expiresAt <= now) {
+        return jsonResponse({ ok: false, error: "Invitation is invalid or has expired." } satisfies AccessCodeVerifyResponse, 403);
+      }
+      if (payload.sessionId && invite.consumedBySessionId && invite.consumedBySessionId !== payload.sessionId) {
+        return jsonResponse({ ok: false, error: "This invitation was consumed by another session." } satisfies AccessCodeVerifyResponse, 403);
+      }
+    } else {
+      return jsonResponse({ ok: false, error: "Valid invitation or creator token required." } satisfies AccessCodeVerifyResponse, 403);
     }
 
     const salt = base64UrlToBytes(this.accessCodeConfig.saltBase64Url);
@@ -992,7 +1000,9 @@ export class RoomDurableObject extends DurableObject<Env> {
 
     this.failedAttempts = 0;
     this.lockedUntil = 0;
-    this.guestVerified = true;
+    if (payload.inviteToken) {
+      this.guestVerified = true;
+    }
     const ticketBytes = crypto.getRandomValues(new Uint8Array(32));
     const ticket = bytesToBase64Url(ticketBytes);
     this.validTickets.set(ticket, {

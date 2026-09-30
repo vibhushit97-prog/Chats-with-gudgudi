@@ -593,8 +593,9 @@ async function copyText(value: string): Promise<boolean> {
 }
 
 function wsUrl(path: string): string {
-  const url = new URL(window.location.origin);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  const origin = import.meta.env.VITE_CLOUDFLARE_WORKER_ORIGIN || window.location.origin;
+  const url = new URL(origin);
+  url.protocol = url.protocol === "https:" || url.protocol === "wss:" ? "wss:" : "ws:";
   url.pathname = path;
   return url.toString();
 }
@@ -771,22 +772,46 @@ function RemovedFromRoomScreen({ focusRef }: RecoveryFocusTarget) {
 function RoomAccessVaultScreen({
   roomId,
   inviteToken,
-  onVerified
+  creatorToken,
+  sessionId,
+  expiresAt,
+  isRejoin,
+  onVerified,
+  onExpired
 }: {
   roomId: string;
   inviteToken?: string;
+  creatorToken?: string;
+  sessionId?: string;
+  expiresAt?: number | null;
+  isRejoin?: boolean;
   onVerified: (ticket: string) => void;
+  onExpired?: () => void;
 }) {
   const [code, setCode] = useState("");
   const [status, setStatus] = useState<"idle" | "verifying" | "success" | "denied" | "locked">("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [remainingAttempts, setRemainingAttempts] = useState<number | null>(null);
   const [lockoutSeconds, setLockoutSeconds] = useState<number | null>(null);
+  const [, setClock] = useState(() => Date.now());
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    if (typeof expiresAt !== "number") return;
+    const timer = setInterval(() => {
+      const cur = Date.now();
+      setClock(cur);
+      if (cur >= expiresAt) {
+        clearInterval(timer);
+        onExpired?.();
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [expiresAt, onExpired]);
 
   useEffect(() => {
     if (!lockoutSeconds || lockoutSeconds <= 0) return;
@@ -814,6 +839,8 @@ function RoomAccessVaultScreen({
     try {
       const res = await verifyAccessCode(roomId, {
         inviteToken,
+        creatorToken,
+        sessionId,
         accessCode: code
       });
 
@@ -848,11 +875,17 @@ function RoomAccessVaultScreen({
 
         <p className="eyebrow brand-eyebrow">[Mehraru] PRIVATE VAULT</p>
         <h1 className="access-title">
-          {status === "success" ? "ACCESS GRANTED" : "ROOM ACCESS REQUIRED"}
+          {status === "success"
+            ? "ACCESS GRANTED"
+            : isRejoin
+            ? "Room still active"
+            : "ROOM ACCESS REQUIRED"}
         </h1>
         <p className="access-copy">
           {status === "success"
             ? "Access verified. Entering private room..."
+            : isRejoin
+            ? "This private room is still available. Enter your Pass Key to rejoin."
             : "Enter the creator-controlled 6-digit access code to enter."}
         </p>
 
@@ -914,9 +947,17 @@ function RoomAccessVaultScreen({
               className={`primary-button vault-verify-btn ${status === "verifying" ? "is-verifying" : ""}`}
               disabled={code.length !== 6 || status === "verifying" || status === "locked"}
             >
-              {status === "verifying" ? "VERIFYING..." : "VERIFY ACCESS CODE"}
+              {status === "verifying"
+                ? (isRejoin ? "REJOINING..." : "VERIFYING...")
+                : (isRejoin ? "Rejoin Room" : "VERIFY ACCESS CODE")}
             </button>
           </form>
+        )}
+
+        {typeof expiresAt === "number" && (
+          <div className="vault-rejoin-countdown" aria-live="polite">
+            Room expires in: {formatRelativeDuration(expiresAt)}
+          </div>
         )}
 
         <div className="vault-access-footer">
@@ -1347,7 +1388,18 @@ function RoomGoneScreen({ fromInvite, reason, focusRef }: { fromInvite: boolean;
 }
 
 export function App() {
-  const route = roomPathname();
+  const [route, setRoute] = useState(roomPathname);
+
+  useEffect(() => {
+    function handlePopState() {
+      setRoute(roomPathname());
+    }
+    window.addEventListener("popstate", handlePopState);
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, []);
+
   useEffect(() => {
     const previousLanguage = document.documentElement.lang;
     // Marketing articles are English; the landing and room UI use the catalog locale.
@@ -1356,6 +1408,7 @@ export function App() {
       document.documentElement.lang = previousLanguage;
     };
   }, [route.view]);
+
   if (route.view === "room" && route.roomId) {
     return <RoomPage roomId={route.roomId} />;
   }
@@ -1370,6 +1423,15 @@ export function App() {
 function LandingPage() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeVault, setActiveVault] = useState<{ roomId: string; url: string; createdAt: number } | null>(() => {
+    const raw = safeStorageGet("session", "elm-chat:active-vault");
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  });
   const [community, setCommunity] = useState<CommunityFeed | null>(null);
   const [communityError, setCommunityError] = useState(false);
   const [ghStats, setGhStats] = useState<{ stars: number | null; forks: number | null }>({
@@ -1464,7 +1526,15 @@ function LandingPage() {
       if (room.accessCode) {
         safeStorageSet("session", `elm-chat:access-code:${room.roomId}`, room.accessCode);
       }
-      window.location.assign(`${room.roomUrl}#${secret}`);
+      safeStorageSet("session", `elm-chat:secret:${room.roomId}`, secret);
+      safeStorageSet("session", `elm-chat:fresh-creator:${room.roomId}`, "1");
+      const targetUrl = `/c/${room.roomId}#${secret}`;
+      safeStorageSet("session", "elm-chat:active-vault", JSON.stringify({
+        roomId: room.roomId,
+        url: targetUrl,
+        createdAt: Date.now()
+      }));
+      window.location.assign(targetUrl);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("unableCreateRoom"));
       setCreating(false);
@@ -1473,6 +1543,39 @@ function LandingPage() {
 
   return (
     <main className="landing-shell">
+      {activeVault ? (
+        <aside className="active-vault-banner" aria-label="Active Vault Session">
+          <div className="active-vault-content">
+            <span className="active-vault-dot" aria-hidden="true" />
+            <div className="active-vault-text">
+              <strong>Active Vault in Progress</strong>
+              <p>You have an open private conversation that is still alive and ticking.</p>
+            </div>
+          </div>
+          <div className="active-vault-actions">
+            <button
+              type="button"
+              className="active-vault-return-btn"
+              onClick={() => {
+                window.location.assign(activeVault.url);
+              }}
+            >
+              Rejoin Vault &rarr;
+            </button>
+            <button
+              type="button"
+              className="active-vault-dismiss-btn"
+              onClick={() => {
+                safeStorageRemove("session", "elm-chat:active-vault");
+                setActiveVault(null);
+              }}
+              title="Dismiss banner"
+            >
+              ✕
+            </button>
+          </div>
+        </aside>
+      ) : null}
       <section className="hero">
         <div className="hero-copy">
           {externalSource === "freshcode" ? (
@@ -1699,10 +1802,31 @@ function LandingPage() {
 }
 
 function RoomPage({ roomId }: { roomId: string }) {
-  const roomSecret = window.location.hash.replace(/^#/, "");
+  const [roomSecret] = useState<string>(() => {
+    const fromHash = window.location.hash.replace(/^#/, "");
+    if (fromHash) {
+      safeStorageSet("session", `elm-chat:secret:${roomId}`, fromHash);
+      return fromHash;
+    }
+    const fromStorage = safeStorageGet("session", `elm-chat:secret:${roomId}`) ?? "";
+    if (fromStorage && !window.location.hash) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${fromStorage}`);
+    }
+    return fromStorage;
+  });
   const inviteToken = new URLSearchParams(window.location.search).get("invite") ?? "";
   const storedCreatorToken = safeStorageGet("local", creatorTokenKey(roomId)) ?? "";
   const isInviteGuest = Boolean(inviteToken && !storedCreatorToken);
+  const isExistingSession = useRef(Boolean(safeStorageGet("session", sessionKey(roomId)))).current;
+  const isFreshCreatorRef = useRef(Boolean(safeStorageGet("session", `elm-chat:fresh-creator:${roomId}`)));
+  const isRejoin = Boolean(storedCreatorToken || isExistingSession);
+  const [rejoinVerified, setRejoinVerified] = useState<boolean>(() => {
+    if (isFreshCreatorRef.current) {
+      safeStorageRemove("session", `elm-chat:fresh-creator:${roomId}`);
+      return true;
+    }
+    return false;
+  });
   const [room, setRoom] = useState<RoomMetadata | null>(null);
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [invites, setInvites] = useState<RoomInvite[]>([]);
@@ -1757,9 +1881,6 @@ function RoomPage({ roomId }: { roomId: string }) {
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [accessCodeTicket, setAccessCodeTicket] = useState<string | null>(() => {
     return safeStorageGet("session", `elm-chat:ticket:${roomId}`);
-  });
-  const [accessCodeVerified, setAccessCodeVerified] = useState<boolean>(() => {
-    return Boolean(safeStorageGet("session", `elm-chat:ticket:${roomId}`));
   });
   const [knownAccessCode, setKnownAccessCode] = useState<string | undefined>(() => {
     return safeStorageGet("session", `elm-chat:access-code:${roomId}`) ?? undefined;
@@ -1993,6 +2114,9 @@ function RoomPage({ roomId }: { roomId: string }) {
     setKeyReady(false);
     safeStorageRemove("session", identityKeyPairKey(roomId, sessionId));
     safeStorageRemove("session", sessionKey(roomId));
+    safeStorageRemove("session", "elm-chat:active-vault");
+    safeStorageRemove("session", `elm-chat:ticket:${roomId}`);
+    safeStorageRemove("session", `elm-chat:secret:${roomId}`);
   }
 
   async function refreshInvites() {
@@ -2294,7 +2418,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         }
 
         const currentTicket = accessCodeTicket || safeStorageGet("session", `elm-chat:ticket:${roomId}`) || undefined;
-        if (metadata.accessCodeProtected && isInviteGuest && !accessCodeVerified && !currentTicket) {
+        if (metadata.accessCodeProtected && !rejoinVerified) {
           setReady(true);
           return;
         }
@@ -2325,12 +2449,12 @@ function RoomPage({ roomId }: { roomId: string }) {
           joinedRef.current = false;
           keyReadyRef.current = false;
           setKeyReady(false);
-          if (isInviteGuest && closeEvent.code === 4403) {
+          if (closeEvent.code === 4403) {
             stopReconnecting();
             if (closeEvent.reason && closeEvent.reason.includes("access code")) {
               safeStorageRemove("session", `elm-chat:ticket:${roomId}`);
               setAccessCodeTicket(null);
-              setAccessCodeVerified(false);
+              setRejoinVerified(false);
               setReady(true);
               return;
             }
@@ -2864,7 +2988,7 @@ function RoomPage({ roomId }: { roomId: string }) {
       socketRef.current?.close();
       for (const [fileId, transfer] of incomingFilesRef.current) removeIncomingFile(fileId, transfer);
     };
-  }, [creatorToken, inviteToken, roomId, roomSecret, sessionId, accessCodeVerified, accessCodeTicket]);
+  }, [creatorToken, inviteToken, roomId, roomSecret, sessionId, rejoinVerified, accessCodeTicket]);
 
   useEffect(() => {
     if (copyFeedback !== "success") {
@@ -3186,9 +3310,15 @@ function RoomPage({ roomId }: { roomId: string }) {
     if (!creatorToken) {
       return;
     }
+    if (!window.confirm("Are you sure you want to permanently end this conversation? This will destroy the room and all messages for both participants.")) {
+      return;
+    }
     try {
       setDestroying(true);
       setDestroyFeedback("idle");
+      safeStorageRemove("session", "elm-chat:active-vault");
+      safeStorageRemove("session", `elm-chat:ticket:${roomId}`);
+      safeStorageRemove("session", `elm-chat:secret:${roomId}`);
       const next = await destroyRoom(roomId, creatorToken);
       await sendPeerData({ type: "peer_destroy" });
       setRoomNotice(null);
@@ -3269,15 +3399,22 @@ function RoomPage({ roomId }: { roomId: string }) {
     );
   }
 
-  if (room?.accessCodeProtected && isInviteGuest && !accessCodeVerified && !accessCodeTicket) {
+  if (room?.accessCodeProtected && !rejoinVerified) {
     return (
       <RoomAccessVaultScreen
         roomId={roomId}
-        inviteToken={inviteToken}
+        inviteToken={inviteToken || undefined}
+        creatorToken={creatorToken || undefined}
+        sessionId={sessionId}
+        expiresAt={room.expiresAt}
+        isRejoin={isRejoin}
         onVerified={(ticket) => {
           safeStorageSet("session", `elm-chat:ticket:${roomId}`, ticket);
           setAccessCodeTicket(ticket);
-          setAccessCodeVerified(true);
+          setRejoinVerified(true);
+        }}
+        onExpired={() => {
+          setRoom((prev) => (prev ? { ...prev, status: "expired" } : prev));
         }}
       />
     );
@@ -3349,21 +3486,45 @@ function RoomPage({ roomId }: { roomId: string }) {
               </button>
             ) : null}
             {isCreator ? (
-              <button
-                className={`vault-action-btn vault-danger-btn ${destroyFeedback === "success" ? "button-success" : ""}`}
-                disabled={!creatorToken || destroying || room?.status !== "open"}
-                onClick={handleDestroy}
-                type="button"
-                title="Permanently wipe vault"
-              >
-                {destroying ? t("destroying") : t("destroy")}
-              </button>
+              <>
+                <button
+                  className="vault-action-btn vault-secondary-btn"
+                  onClick={() => {
+                    if (window.confirm("Leave this vault? The room will remain active and secure until its countdown ends or you return to end it.")) {
+                      if (socketRef.current) {
+                        socketRef.current.close(1000, "user_navigation");
+                        socketRef.current = null;
+                      }
+                      window.history.pushState(null, "", "/");
+                      window.dispatchEvent(new PopStateEvent("popstate"));
+                    }
+                  }}
+                  type="button"
+                  title="Leave vault without ending it"
+                >
+                  Leave Vault
+                </button>
+                <button
+                  className={`vault-action-btn vault-danger-btn ${destroyFeedback === "success" ? "button-success" : ""}`}
+                  disabled={!creatorToken || destroying || room?.status !== "open"}
+                  onClick={handleDestroy}
+                  type="button"
+                  title="Permanently wipe vault"
+                >
+                  {destroying ? t("destroying") : t("destroy")}
+                </button>
+              </>
             ) : (
               <button
                 className="vault-action-btn vault-danger-btn"
                 onClick={() => {
                   if (window.confirm(t("leaveConfirm"))) {
-                    window.location.assign("/");
+                    if (socketRef.current) {
+                      socketRef.current.close(1000, "user_navigation");
+                      socketRef.current = null;
+                    }
+                    window.history.pushState(null, "", "/");
+                    window.dispatchEvent(new PopStateEvent("popstate"));
                   }
                 }}
                 type="button"

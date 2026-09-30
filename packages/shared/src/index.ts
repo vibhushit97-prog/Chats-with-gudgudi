@@ -182,6 +182,8 @@ export interface AccessCodeManageResponse {
 
 export interface AccessCodeVerifyRequest {
   inviteToken?: string;
+  creatorToken?: string;
+  sessionId?: string;
   accessCode: string;
 }
 

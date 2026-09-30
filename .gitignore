@@ -8,3 +8,10 @@ agents.md
 
 # Internal go-to-market / growth strategy — kept local, not published
 gtm/
+
+.env
+.env.*
+!.env.example
+.vercel
+.next
+build
