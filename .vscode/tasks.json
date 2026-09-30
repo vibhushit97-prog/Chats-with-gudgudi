@@ -29,7 +29,7 @@
     },
     {
       "label": "dev:web",
-      "detail": "Vite dev server with HMR (:3000, proxies /api to the Worker)",
+      "detail": "Vite dev server with HMR (:3001, proxies /api to the Worker)",
       "type": "shell",
       "command": "npm run dev:web",
       "isBackground": true,
@@ -64,7 +64,7 @@
       "label": "dev",
       "detail": "Start the full stack and open elm.chat in your default browser (no debugger).",
       "type": "shell",
-      "command": "open http://localhost:3000 || xdg-open http://localhost:3000 || start http://localhost:3000",
+      "command": "open http://localhost:3001 || xdg-open http://localhost:3001 || start http://localhost:3001",
       "dependsOn": ["dev:servers"],
       "problemMatcher": [],
       "group": {

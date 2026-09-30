@@ -5,7 +5,7 @@
       "name": "Debug: elm.chat (Chrome)",
       "type": "chrome",
       "request": "launch",
-      "url": "http://localhost:3000",
+      "url": "http://localhost:3001",
       "webRoot": "${workspaceFolder}/apps/web",
       "preLaunchTask": "dev:servers",
       "sourceMaps": true
@@ -14,7 +14,7 @@
       "name": "Debug: elm.chat (Edge)",
       "type": "msedge",
       "request": "launch",
-      "url": "http://localhost:3000",
+      "url": "http://localhost:3001",
       "webRoot": "${workspaceFolder}/apps/web",
       "preLaunchTask": "dev:servers",
       "sourceMaps": true
