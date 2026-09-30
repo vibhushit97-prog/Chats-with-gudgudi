@@ -1,17 +1,8 @@
-node_modules
-dist
-.wrangler
-.DS_Store
-coverage
-AGENTS.md
-agents.md
-
-# Internal go-to-market / growth strategy — kept local, not published
-gtm/
-
+﻿node_modules/
+.next/
+dist/
+build/
 .env
-.env.*
-!.env.example
-.vercel
-.next
-build
+.env.local
+.env.*.local
+.vercel/
